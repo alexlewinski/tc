@@ -7,7 +7,8 @@ use tc_core::ckpt::{CkptWriter, CODEC_RAW};
 use tc_core::weights::{SafeTensorsFiles, TensorSource};
 
 /// Write `fixtures/tiny-klein` (see scripts/fixtures/snapshot_tiny.py) into `dir` the way a
-/// Draw Things models folder holds a model: `flux_2_klein_tiny_f32.ckpt`, `qwen_3_tiny_f32.ckpt`,
+/// Draw Things models folder holds a model: `flux_2_klein_tiny_f32.ckpt` (and a palettized
+/// `flux_2_klein_tiny_q8p.ckpt`), `qwen_3_tiny_f32.ckpt`,
 /// `flux_2_vae_tiny.ckpt` (f32 tensors), the tokenizer in `flux_2_tokenizer/`, `lora_a.safetensors`
 /// as is and `lora_b` converted to Draw Things' LoRA layout as `lora_b_dt.ckpt`
 /// (`__dit__[...]__down__` / `__up__`, alpha folded in). Does nothing if `dir/done` exists.
@@ -25,7 +26,19 @@ pub fn write_tiny_draw_things_models(fixtures: &Path, dir: &Path) -> Result<()> 
         w.finish()
     };
     let (src, config) = tc_core::models::flux2::open_source(&snap.join("transformer"))?;
-    write("flux_2_klein_tiny_f32.ckpt", tc_core::models::flux2::dt_tensors(&src, &config)?)?;
+    let transformer = tc_core::models::flux2::dt_tensors(&src, &config)?;
+    // Like Draw Things' `_q8p` files: f16, matrices 8-bit palettized (loaded as such on GPU).
+    let mut w = CkptWriter::new(&dir.join("flux_2_klein_tiny_q8p.ckpt"), false)?;
+    for (n, t) in &transformer {
+        let t = t.to_dtype(nnc::DataType::F16);
+        if t.shape().len() == 2 && t.numel() % 1024 == 0 {
+            w.q8p(n, &t, 1024)?;
+        } else {
+            w.dense(n, &t, CODEC_RAW)?;
+        }
+    }
+    w.finish()?;
+    write("flux_2_klein_tiny_f32.ckpt", transformer)?;
     let te = SafeTensorsFiles::open_dir(&snap.join("text_encoder"))?;
     let te_config = serde_json::from_slice(&std::fs::read(snap.join("text_encoder/config.json"))?)?;
     write("qwen_3_tiny_f32.ckpt", tc_core::models::qwen3::dt_tensors(&te, &te_config)?)?;

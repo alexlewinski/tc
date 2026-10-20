@@ -487,9 +487,10 @@ impl Flux2Engine {
         self.ensure_transformer()?;
         self.apply_loras(&p.loras)?;
         let device = self.options.device;
-        let dtype = self.options.precision.transformer;
         let graph = self.graph.clone();
         let t = self.transformer.as_ref().unwrap();
+        // The loaded model's type, not the requested one: palettized weights force f16 on GPU.
+        let dtype = t.model.dtype;
         let model = &t.model;
         let config: &Flux2Config = &model.config;
         let channels = config.in_channels;

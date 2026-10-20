@@ -91,6 +91,27 @@ fn cli_generate_with_draw_things_checkpoints_matches_reference() {
     assert!(max <= 1.5 / 255.0, "max pixel error {max}");
 }
 
+/// Metal (`NNC_TEST_DEVICE=gpu`): a palettized (`_q8p`) Draw Things checkpoint at the default
+/// precision with a Draw Things LoRA and a reference image. Palettized weights run in f16 on
+/// GPU while the default is bf16; every input the transformer sees must follow the model.
+#[test]
+fn cli_metal_draw_things_q8p_checkpoint() {
+    if std::env::var("NNC_TEST_DEVICE").as_deref() != Ok("gpu") {
+        eprintln!("skipped: set NNC_TEST_DEVICE=gpu to run on Metal");
+        return;
+    }
+    let dir = draw_things_models_dir();
+    let loras = ["lora_a.safetensors:0.8", "lora_b_dt.ckpt:0.5"];
+    let reference = fixtures().join("ref.png");
+    let got = generate_with("dt-q8p", &dir, "flux_2_klein_tiny_q8p.ckpt", loras, &["--image", reference.to_str().unwrap()]);
+    assert!(got.iter().all(|v| v.is_finite()));
+    let (max, mean) = error(&got, "expected_ref.safetensors");
+    eprintln!("metal q8p checkpoint: max error {max:.4}, mean error {mean:.5}");
+    // The same request on CPU (8-bit weights, f32) gives max 0.068 / mean 0.0015; f16 adds a
+    // little. A wrong input type or layout is far outside this.
+    assert!(max <= 0.2 && mean <= 0.01, "max {max}, mean {mean}");
+}
+
 /// Metal smoke test (`NNC_TEST_DEVICE=gpu`, a Mac with a real GPU): the reference image + two
 /// LoRAs case through the CLI on the GPU at each precision. Reduced precision gets looser bounds;
 /// they catch broken kernels and layouts, not rounding.
