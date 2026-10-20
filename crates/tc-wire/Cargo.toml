@@ -1,0 +1,16 @@
+[package]
+name = "tc-wire"
+description = "Tensor wire format used for images in the gRPC API (nnc tensor header + raw / deflate / fpzip payload)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+flate2 = "1"
+half = "2"
+anyhow = "1"
+bytemuck = { version = "1", features = ["extern_crate_alloc"] }
+
+[build-dependencies]
+cc = "1"

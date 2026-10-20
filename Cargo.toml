@@ -4,6 +4,8 @@ members = [
   "crates/nnc-sys",
   "crates/nnc",
   "crates/tc-core",
+  "crates/tc-config",
+  "crates/tc-wire",
 ]
 
 [workspace.package]
