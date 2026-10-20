@@ -1,0 +1,39 @@
+#ifndef NAInt8MatMulKernel_hpp
+#define NAInt8MatMulKernel_hpp
+
+#include "NAInt8MatMulKernelDescriptor.hpp"
+#include "GEMMOperandPrecision.hpp"
+#include "nnc/mfa/3rdparty/metal-cpp/Metal.hpp"
+#include <simd/simd.h>
+
+class CodeWriter;
+
+struct NAInt8MatMulKernel {
+  NS::SharedPtr<MTL::Library> library;
+  std::string source;
+
+  simd::ushort3 blockDimensions;
+  uint16_t executionSIMDGroups;
+  GEMMOperandPrecision ioPrecision;
+  bool useRegisterOperands;
+  bool useBias;
+  bool loadM;
+  bool useLeadingDimensions;
+  uint16_t activationQuantizeThreads;
+  bool activationHadamard256;
+  uint32_t groupM;
+  uint32_t groupN;
+
+  NAInt8MatMulKernel(NAInt8MatMulKernelDescriptor descriptor, MTL::Device *const device);
+
+  // Total count; use threadsPerThreadgroup for the dispatch layout.
+  uint16_t threadgroupSize(MTL::ComputePipelineState *const pipelineState) const noexcept;
+  MTL::Size threadsPerThreadgroup(MTL::ComputePipelineState *const pipelineState) const noexcept;
+  MTL::Size threadgroupsPerGrid(uint32_t M, uint32_t N, uint32_t batchDimension) const noexcept;
+
+private:
+  std::string createSource() const noexcept;
+};
+
+
+#endif

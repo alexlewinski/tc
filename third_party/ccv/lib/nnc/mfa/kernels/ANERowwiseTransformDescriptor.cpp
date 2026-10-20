@@ -1,0 +1,111 @@
+#include "ANERowwiseTransformDescriptor.hpp"
+#include "ANERowwiseTransformKernel.hpp"
+#include "../ccv_nnc_mfa_hash.hpp"
+#include "../ccv_nnc_mfa_error.hpp"
+
+bool ANERowwiseTransformDescriptor::operator==(const ANERowwiseTransformDescriptor& rhs) const
+{
+  return
+      memoryPrecision == rhs.memoryPrecision &&
+      activationHadamard256 == rhs.activationHadamard256 &&
+      M == rhs.M &&
+      paddedM == rhs.paddedM &&
+      batchDimension == rhs.batchDimension &&
+      N == rhs.N &&
+      K == rhs.K &&
+      batchStrideA == rhs.batchStrideA &&
+      batchStrideC == rhs.batchStrideC &&
+      sourceRowOffset == rhs.sourceRowOffset &&
+      outputRowOffset == rhs.outputRowOffset &&
+      activationScaleBatchStride == rhs.activationScaleBatchStride &&
+      activationScaleRowOffset == rhs.activationScaleRowOffset;
+}
+
+std::size_t std::hash<ANERowwiseTransformDescriptor>::operator()(const ANERowwiseTransformDescriptor& hash) const noexcept
+{
+  std::size_t seed = 0;
+  using namespace ccv::nnc::mfa::hash;
+  seed = combine_32(seed, (uint32_t)hash.memoryPrecision.value);
+  seed = combine_32(seed, hash.activationHadamard256 ? 1 : 0);
+  seed = combine_32(seed, hash.M);
+  seed = combine_32(seed, hash.paddedM);
+  seed = combine_32(seed, hash.batchDimension);
+  seed = combine_32(seed, hash.N);
+  seed = combine_32(seed, hash.K);
+  seed = combine_32(seed, hash.batchStrideA);
+  seed = combine_32(seed, hash.batchStrideC);
+  seed = combine_32(seed, hash.sourceRowOffset);
+  seed = combine_32(seed, hash.outputRowOffset);
+  seed = combine_32(seed, hash.activationScaleBatchStride);
+  seed = combine_32(seed, hash.activationScaleRowOffset);
+  return seed;
+}
+
+std::pair<ANERowwiseTransformKernelDescriptor, PipelineValue<ANERowwiseTransformKernel>*> ANERowwiseTransformDescriptor::findKernel(
+    MTL::Device* const device,
+    const DeviceProperties& dprops,
+    NS::Array* const binaryArchivesToRead,
+    MTL::BinaryArchive* const binaryArchiveToWrite,
+    const std::string& pathToWrite,
+    std::unordered_map<ANERowwiseTransformKernelDescriptor, std::unique_ptr<ANERowwiseTransformKernel>> *const libraryCache) const noexcept
+{
+  (void)dprops;
+  CCV_NNC_MFA_PRECONDITION(!activationHadamard256 || (K > 0 && K <= 65536 && K % 256 == 0 && M > 0 && batchDimension > 0 && paddedM >= M * batchDimension && paddedM % 128 == 0));
+
+  auto createKernel =
+  [=](const ANERowwiseTransformKernelDescriptor& descriptor) -> ANERowwiseTransformKernel* {
+    auto iterator = libraryCache->find(descriptor);
+    if (iterator != libraryCache->end())
+      return iterator->second.get();
+    ANERowwiseTransformKernel* kernel = new ANERowwiseTransformKernel(descriptor, device);
+    (*libraryCache)[descriptor] = std::unique_ptr<ANERowwiseTransformKernel>(kernel);
+    return kernel;
+  };
+
+  auto createPipeline =
+  [=](ANERowwiseTransformKernel* kernel, const char* functionNameString) -> MTL::ComputePipelineState* {
+    auto constants = NS::TransferPtr(MTL::FunctionConstantValues::alloc()->init());
+    constants->setConstantValue(&M, MTL::DataTypeUInt, NS::UInteger(0));
+    constants->setConstantValue(&paddedM, MTL::DataTypeUInt, NS::UInteger(1));
+    constants->setConstantValue(&batchDimension, MTL::DataTypeUInt, NS::UInteger(2));
+    constants->setConstantValue(&N, MTL::DataTypeUInt, NS::UInteger(3));
+    constants->setConstantValue(&K, MTL::DataTypeUInt, NS::UInteger(4));
+    constants->setConstantValue(&batchStrideA, MTL::DataTypeUInt, NS::UInteger(5));
+    constants->setConstantValue(&batchStrideC, MTL::DataTypeUInt, NS::UInteger(6));
+    constants->setConstantValue(&sourceRowOffset, MTL::DataTypeUInt, NS::UInteger(7));
+    constants->setConstantValue(&outputRowOffset, MTL::DataTypeUInt, NS::UInteger(8));
+    constants->setConstantValue(&activationScaleBatchStride, MTL::DataTypeUInt, NS::UInteger(9));
+    constants->setConstantValue(&activationScaleRowOffset, MTL::DataTypeUInt, NS::UInteger(10));
+
+    auto functionName = NS::String::string(functionNameString, NS::UTF8StringEncoding);
+    NS::Error* error = nil;
+    auto function = NS::TransferPtr(kernel->library->newFunction(functionName, constants.get(), &error));
+    CCV_NNC_MFA_CHECK_ERROR(error);
+    error = nil;
+    MTL::ComputePipelineState* pipeline = device->newComputePipelineState(function.get(), &error);
+    CCV_NNC_MFA_CHECK_ERROR(error);
+    return pipeline;
+  };
+
+  auto kernelDesc = ANERowwiseTransformKernelDescriptor(
+      memoryPrecision,
+      device->supportsFamily(MTL::GPUFamily(1010)),
+      activationHadamard256);
+  auto kernel = createKernel(kernelDesc);
+  // Retain narrow rows through quantization. Wider rows use a separate
+  // reduction and tiled transpose; Hadamard recomputes each transformed tile
+  // to avoid full-row register pressure and an activation staging buffer.
+  auto prepareActivation = NS::TransferPtr(createPipeline(kernel, activationHadamard256 ? (K <= 8192 ? "quantize_hadamard_activation" : "compute_hadamard_activation_maxima") : (K <= 8192 ? "quantize_activation" : "compute_activation_scales")));
+  auto quantizeActivation = NS::TransferPtr(createPipeline(kernel, activationHadamard256 ? "quantize_transpose_hadamard_activation" : "quantize_transpose_activation"));
+  auto dequantizeOutputTransposed = NS::TransferPtr(createPipeline(kernel, "dequantize_output_transposed"));
+  auto dequantizeOutputTransposedBias = NS::TransferPtr(createPipeline(kernel, "dequantize_output_transposed_bias"));
+  auto transposeQuantizedActivation = NS::TransferPtr(createPipeline(kernel, "transpose_quantized_activation"));
+
+  PipelineValue<ANERowwiseTransformKernel>* output =
+      new PipelineValue<ANERowwiseTransformKernel> { kernel, prepareActivation };
+  output->second = quantizeActivation;
+  output->third = dequantizeOutputTransposed;
+  output->fourth = dequantizeOutputTransposedBias;
+  output->fifth = transposeQuantizedActivation;
+  return std::make_pair(kernelDesc, output);
+}

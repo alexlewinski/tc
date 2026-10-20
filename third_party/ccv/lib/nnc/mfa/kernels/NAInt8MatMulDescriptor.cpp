@@ -1,0 +1,161 @@
+#include "NAInt8MatMulDescriptor.hpp"
+#include "NAInt8MatMulKernelDescriptor.hpp"
+#include "NAInt8MatMulKernel.hpp"
+#include "../ccv_nnc_mfa_hash.hpp"
+#include "../ccv_nnc_mfa_error.hpp"
+#include <cstring>
+
+namespace {
+
+static void serializeBinaries(MTL::BinaryArchive *const binaryArchive, const std::string& pathToWrite) noexcept {
+  NS::Error *error = nil;
+  binaryArchive->serializeToURL(NS::URL::fileURLWithPath(NS::String::string(pathToWrite.c_str(), NS::UTF8StringEncoding)), &error);
+}
+
+}
+
+bool NAInt8MatMulDescriptor::operator==(const NAInt8MatMulDescriptor& rhs) const {
+  auto lhsMatrixDimensions = matrixDimensions;
+  auto rhsMatrixDimensions = rhs.matrixDimensions;
+  auto lhsBatchStrides = batchStrides.value_or(simd::uint4(UINT32_MAX));
+  auto rhsBatchStrides = rhs.batchStrides.value_or(simd::uint4(UINT32_MAX));
+  if (loadM) {
+    lhsMatrixDimensions[0] = rhsMatrixDimensions[0] = 0;
+    lhsBatchStrides[0] = rhsBatchStrides[0] = 0;
+    lhsBatchStrides[2] = rhsBatchStrides[2] = 0;
+  }
+  return
+    batchDimension == rhs.batchDimension &&
+    ioPrecision == rhs.ioPrecision &&
+    batchStrides.has_value() == rhs.batchStrides.has_value() &&
+    simd_all(lhsBatchStrides == rhsBatchStrides) &&
+    leadingDimensions.has_value() == rhs.leadingDimensions.has_value() &&
+    simd_all(leadingDimensions.value_or(simd::uint2(UINT32_MAX)) == rhs.leadingDimensions.value_or(simd::uint2(UINT32_MAX))) &&
+    (loadM || packedABatchStride == rhs.packedABatchStride) &&
+    (loadM || aScaleBatchStride == rhs.aScaleBatchStride) &&
+    useBias == rhs.useBias &&
+    activationHadamard256 == rhs.activationHadamard256 &&
+    loadM == rhs.loadM &&
+    supportIndirectCommandBuffers == rhs.supportIndirectCommandBuffers &&
+    simd_all(lhsMatrixDimensions == rhsMatrixDimensions);
+}
+
+std::size_t std::hash<NAInt8MatMulDescriptor>::operator()(const NAInt8MatMulDescriptor& hash) const noexcept {
+  std::size_t seed = 0;
+  using namespace ccv::nnc::mfa::hash;
+  seed = combine_64(seed, hash.batchDimension);
+  seed = combine_32(seed, (uint32_t)hash.ioPrecision.value);
+  seed = combine_32(seed, hash.loadM ? 0 : hash.matrixDimensions[0]);
+  seed = combine_32(seed, hash.matrixDimensions[1]);
+  seed = combine_32(seed, hash.matrixDimensions[2]);
+  seed = combine_32(seed, hash.batchStrides.has_value());
+  const auto batchStrides = hash.batchStrides.value_or(simd::uint4(UINT32_MAX));
+  seed = combine_32(seed, hash.loadM ? 0 : batchStrides[0]);
+  seed = combine_32(seed, batchStrides[1]);
+  seed = combine_32(seed, hash.loadM ? 0 : batchStrides[2]);
+  seed = combine_32(seed, batchStrides[3]);
+  const auto leadingDimensions = hash.leadingDimensions.value_or(simd::uint2(UINT32_MAX));
+  seed = combine_32(seed, hash.leadingDimensions.has_value());
+  seed = combine_32(seed, leadingDimensions[0]);
+  seed = combine_32(seed, leadingDimensions[1]);
+  seed = combine_32(seed, hash.loadM ? 0 : hash.packedABatchStride.value_or(0));
+  seed = combine_32(seed, hash.loadM ? 0 : hash.aScaleBatchStride.value_or(0));
+  seed = combine_32(seed, hash.useBias ? 1 : 0);
+  seed = combine_32(seed, hash.activationHadamard256 ? 1 : 0);
+  seed = combine_32(seed, hash.loadM ? 1 : 0);
+  seed = combine_32(seed, hash.supportIndirectCommandBuffers ? 1 : 0);
+  return seed;
+}
+
+std::pair<NAInt8MatMulKernelDescriptor, PipelineValue<NAInt8MatMulKernel> *> NAInt8MatMulDescriptor::findKernel(
+    MTL::Device* const device,
+    const NAInt8MatMulKernelDescriptor& kernelDesc,
+    NS::Array* const binaryArchivesToRead,
+    MTL::BinaryArchive* const binaryArchiveToWrite,
+    const std::string& pathToWrite,
+    std::unordered_map<NAInt8MatMulKernelDescriptor, std::unique_ptr<NAInt8MatMulKernel>> *const libraryCache) const noexcept
+{
+  CCV_NNC_MFA_PRECONDITION(!activationHadamard256 || (matrixDimensions[2] > 0 && matrixDimensions[2] <= 65536 && matrixDimensions[2] % 256 == 0));
+
+  auto createKernel =
+  [=](const NAInt8MatMulKernelDescriptor& descriptor) -> NAInt8MatMulKernel* {
+    auto iterator = libraryCache->find(descriptor);
+    if (iterator != libraryCache->end())
+      return iterator->second.get();
+    NAInt8MatMulKernel* kernel = new NAInt8MatMulKernel(descriptor, device);
+    (*libraryCache)[descriptor] = std::unique_ptr<NAInt8MatMulKernel>(kernel);
+    return kernel;
+  };
+
+  auto createPipeline =
+  [=](NAInt8MatMulKernel* kernel, const char* functionNameString) -> MTL::ComputePipelineState* {
+    auto constants = NS::TransferPtr(MTL::FunctionConstantValues::alloc()->init());
+    const uint32_t M = matrixDimensions[0];
+    const uint32_t N = matrixDimensions[1];
+    const uint32_t K = matrixDimensions[2];
+    const bool batched = batchDimension > 1;
+    const simd::uint4 batchStrides = this->batchStrides.value_or(simd::uint4(0));
+    const uint32_t batchStrideSourceA = batchStrides[0];
+    const uint32_t batchStridePackedA = packedABatchStride.value_or(batched ? M * K : 0);
+    const uint32_t batchStrideB = batchStrides[1];
+    const uint32_t batchStrideC = batchStrides[2];
+    const uint32_t batchStrideBias = batchStrides[3];
+    const uint32_t batchStrideAScale = aScaleBatchStride.value_or(batched ? M : 0);
+    const uint32_t batchStrideBScale = batchStrides[1] > 0 ? N : 0;
+    const bool quantizeActivation = (strcmp(functionNameString, "quantize_activation") == 0);
+    const uint32_t batchStrideA = quantizeActivation ? batchStrideSourceA : batchStridePackedA;
+    if (!this->loadM)
+      constants->setConstantValue(&M, MTL::DataTypeUInt, NS::UInteger(0));
+    constants->setConstantValue(&N, MTL::DataTypeUInt, NS::UInteger(1));
+    constants->setConstantValue(&K, MTL::DataTypeUInt, NS::UInteger(2));
+    constants->setConstantValue(&batched, MTL::DataTypeBool, NS::UInteger(11));
+    if (!this->loadM)
+      constants->setConstantValue(&batchStrideA, MTL::DataTypeUInt, NS::UInteger(15));
+    constants->setConstantValue(&batchStrideB, MTL::DataTypeUInt, NS::UInteger(16));
+    if (!this->loadM)
+      constants->setConstantValue(&batchStrideC, MTL::DataTypeUInt, NS::UInteger(17));
+    constants->setConstantValue(&batchStrideBias, MTL::DataTypeUInt, NS::UInteger(18));
+    if (!this->loadM)
+      constants->setConstantValue(&batchStrideAScale, MTL::DataTypeUInt, NS::UInteger(19));
+    constants->setConstantValue(&batchStrideBScale, MTL::DataTypeUInt, NS::UInteger(20));
+    if (!this->loadM)
+      constants->setConstantValue(&batchStridePackedA, MTL::DataTypeUInt, NS::UInteger(21));
+    if (this->leadingDimensions.has_value()) {
+      const uint32_t leadingDimensionA = this->leadingDimensions.value()[0];
+      const uint32_t leadingDimensionC = this->leadingDimensions.value()[1];
+      constants->setConstantValue(&leadingDimensionA, MTL::DataTypeUInt, NS::UInteger(22));
+      constants->setConstantValue(&leadingDimensionC, MTL::DataTypeUInt, NS::UInteger(23));
+    }
+    NS::Error* error = nil;
+    auto functionName = NS::String::string(functionNameString, NS::UTF8StringEncoding);
+    auto function = NS::TransferPtr(kernel->library->newFunction(functionName, constants.get(), &error));
+    CCV_NNC_MFA_CHECK_ERROR(error);
+    auto pipelineDescriptor = NS::TransferPtr(MTL::ComputePipelineDescriptor::alloc()->init());
+    pipelineDescriptor->setComputeFunction(function.get());
+    pipelineDescriptor->setSupportIndirectCommandBuffers(this->supportIndirectCommandBuffers);
+    MTL::ComputePipelineState* pipeline = nullptr;
+    if (binaryArchivesToRead) {
+      pipelineDescriptor->setBinaryArchives(binaryArchivesToRead);
+      pipeline = device->newComputePipelineState(pipelineDescriptor.get(), MTL::PipelineOptionFailOnBinaryArchiveMiss, nullptr, &error);
+    }
+    if (pipeline == nullptr) {
+      error = nil;
+      pipeline = device->newComputePipelineState(pipelineDescriptor.get(), MTL::PipelineOptionNone, nullptr, &error);
+      if (binaryArchiveToWrite != nullptr) {
+        NS::Error* archiveError = nil;
+        binaryArchiveToWrite->addComputePipelineFunctions(pipelineDescriptor.get(), &archiveError);
+        serializeBinaries(binaryArchiveToWrite, pathToWrite);
+      }
+    }
+    CCV_NNC_MFA_CHECK_ERROR(error);
+    return pipeline;
+  };
+
+  auto kernel = createKernel(kernelDesc);
+  auto pipeline = NS::TransferPtr(createPipeline(kernel, "int8_matmul"));
+  auto quantize = NS::TransferPtr(createPipeline(kernel, "quantize_activation"));
+
+  PipelineValue<NAInt8MatMulKernel>* output = new PipelineValue<NAInt8MatMulKernel> { kernel, pipeline };
+  output->second = quantize;
+  return std::make_pair(kernelDesc, output);
+}

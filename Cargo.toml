@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/nnc-sys",
+  "crates/nnc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/alexlewinski/tonic-clap"
+rust-version = "1.80"
+
+[profile.release]
+opt-level = 3
+debug = 1

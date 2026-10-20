@@ -1,0 +1,991 @@
+#include <ccv.h>
+#include <ccv_internal.h>
+#include <nnc/ccv_nnc.h>
+#include <nnc/ccv_nnc_easy.h>
+#include <nnc/ccv_nnc_internal.h>
+#include <nnc/mps/ccv_nnc_mps.h>
+
+typedef struct {
+	int subtype;
+	ccv_nnc_mfa_depalettize_params_t depalettize_params;
+	ccv_nnc_mfa_dequantize_8i_rowwise_params_t dequantize_8i_rowwise_params;
+} ccv_nnc_mfa_qx_decode_params_t;
+
+static size_t _ccv_nnc_qx_dense_data_size(const ccv_nnc_tensor_param_t params)
+{
+	const int subtype = params.datatype & 0xf00;
+	ccv_nnc_tensor_param_t dense_params = params;
+	dense_params.datatype = (params.datatype & 0xff) << 12;
+	dense_params.reserved = 0;
+	if ((subtype >= 0x400 && subtype <= 0x800) || subtype == CCV_NNC_QX_8I_ROWWISE)
+		return ccv_nnc_tensor_data_size(dense_params);
+	assert(0);
+	return 0;
+}
+
+static ccv_nnc_mfa_qx_decode_params_t _ccv_nnc_mfa_qx_decode_params(const ccv_nnc_tensor_param_t params, const uint32_t mtl_data_type)
+{
+	const int subtype = params.datatype & 0xf00;
+	ccv_nnc_mfa_qx_decode_params_t decode_params = {
+		.subtype = subtype,
+	};
+	if (subtype >= 0x400 && subtype <= 0x800)
+	{
+		const size_t count = ccv_nnc_tensor_count(params);
+		const int qbits = subtype >> 8;
+		decode_params.depalettize_params = (ccv_nnc_mfa_depalettize_params_t){
+			.data_type = mtl_data_type,
+			.qbits = (uint32_t)qbits,
+			.number_in_blocks = (uint32_t)params.reserved,
+			.length = (uint64_t)count,
+		};
+	} else if (subtype == CCV_NNC_QX_8I_ROWWISE) {
+		const int nd = ccv_nnc_tensor_nd(params.dim);
+		decode_params.dequantize_8i_rowwise_params = (ccv_nnc_mfa_dequantize_8i_rowwise_params_t){
+			.data_type = mtl_data_type,
+			.row_length = (uint64_t)params.dim[nd - 1],
+			.length = (uint64_t)ccv_nnc_tensor_count(params),
+		};
+	} else {
+		assert(0);
+	}
+	return decode_params;
+}
+
+static void _ccv_nnc_mfa_prepare_qx_decode(ccv_nnc_mfa_context_t* const context, const ccv_nnc_mfa_qx_decode_params_t params)
+{
+	if (params.subtype >= 0x400 && params.subtype <= 0x800)
+		ccv_nnc_mfa_prepare_depalettize(context, params.depalettize_params);
+	else if (params.subtype == CCV_NNC_QX_8I_ROWWISE)
+		ccv_nnc_mfa_prepare_dequantize_8i_rowwise(context, params.dequantize_8i_rowwise_params);
+	else {
+		assert(0);
+	}
+}
+
+static void _ccv_nnc_mfa_encode_qx_decode(ccv_nnc_mfa_context_t* const context, const ccv_nnc_mfa_qx_decode_params_t params, mtl_command_batch_t* const command_batch, mtl_buffer_t* const source, const size_t source_offset, mtl_buffer_t* const destination, const size_t destination_offset)
+{
+	mtl_buffer_t* tensors[3] = {
+		source,
+		destination,
+		NULL,
+	};
+	size_t tensor_offsets[2] = {
+		source_offset,
+		destination_offset,
+	};
+	if (params.subtype >= 0x400 && params.subtype <= 0x800)
+		ccv_nnc_mfa_encode_depalettize(context, params.depalettize_params, command_batch, tensors, tensor_offsets);
+	else if (params.subtype == CCV_NNC_QX_8I_ROWWISE)
+		ccv_nnc_mfa_encode_dequantize_8i_rowwise(context, params.dequantize_8i_rowwise_params, command_batch, tensors, tensor_offsets);
+	else {
+		assert(0);
+	}
+}
+
+static int _ccv_nnc_scaled_dot_product_attention_forw_mps(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint, const int flags, ccv_nnc_tensor_t* const* const inputs, const int input_size, ccv_nnc_tensor_t* const* const outputs, const int output_size, ccv_nnc_stream_context_t* const stream_context)
+{
+	// NNC notation:
+	// C = sm(Q * K^T) * V
+	//
+	// MFA notation:
+	// O = sm(Q * K^T) * V
+	assert(input_size >= 3);
+	assert(output_size >= 1);
+	const int is_varlen = cmd.info.scaled_dot_product_attention.is_varlen;
+	ccv_nnc_tensor_view_t* const q = (ccv_nnc_tensor_view_t*)inputs[0];
+	ccv_nnc_tensor_view_t* const k = (ccv_nnc_tensor_view_t*)inputs[1];
+	ccv_nnc_tensor_view_t* const v = (ccv_nnc_tensor_view_t*)inputs[2];
+	ccv_nnc_tensor_view_t* const attn_mask = input_size > 3 ? (ccv_nnc_tensor_view_t*)inputs[3] : 0;
+	ccv_nnc_tensor_view_t* const weights = input_size > 4 ? (ccv_nnc_tensor_view_t*)inputs[4] : 0;
+	ccv_nnc_tensor_view_t* const bias = input_size > 5 ? (ccv_nnc_tensor_view_t*)inputs[5] : 0;
+	ccv_nnc_tensor_view_t* const q_seq_offsets = is_varlen && input_size > 6 ? (ccv_nnc_tensor_view_t*)inputs[6] : 0;
+	ccv_nnc_tensor_view_t* const kv_seq_offsets = is_varlen && input_size > 7 ? (ccv_nnc_tensor_view_t*)inputs[7] : 0;
+	const int attention_sinks = cmd.info.scaled_dot_product_attention.attention_sinks;
+	const int sliding_window = cmd.info.scaled_dot_product_attention.sliding_window;
+	ccv_nnc_tensor_view_t* const sinks = attention_sinks && input_size > 8 ? (ccv_nnc_tensor_view_t*)inputs[8] : 0;
+	if (bias) // bias always requires a weight matrix.
+	{
+		assert(CCV_GET_DATA_TYPE(bias->info.datatype) != CCV_QX);
+		assert(weights);
+	}
+	if (is_varlen && (attn_mask || weights || bias || !q_seq_offsets || !kv_seq_offsets))
+		return CCV_NNC_EXEC_INVALID;
+	if (attention_sinks && !sinks)
+		return CCV_NNC_EXEC_INVALID;
+	if (sliding_window < 0 || (sliding_window > 0 && (!cmd.info.scaled_dot_product_attention.is_causal || is_varlen)))
+		return CCV_NNC_EXEC_INVALID;
+	if (sliding_window > 0 && (cmd.info.scaled_dot_product_attention.flags & CCV_NNC_GEMM_8I))
+		return CCV_NNC_EXEC_INVALID;
+
+	ccv_nnc_tensor_view_t* const o = (weights) ? (ccv_nnc_tensor_view_t*)outputs[2] : (ccv_nnc_tensor_view_t*)outputs[0];
+	if (q->info.dim[0] == 0 || k->info.dim[0] == 0 || v->info.dim[0] == 0 || o->info.dim[0] == 0)
+		return CCV_NNC_EXEC_INVALID;
+	const int q_nd = ccv_nnc_tensor_nd(q->info.dim);
+	assert(q_nd == 3 || q_nd == 4);
+	const int k_nd = ccv_nnc_tensor_nd(k->info.dim);
+	assert(k_nd == 3 || k_nd == 4);
+	const int v_nd = ccv_nnc_tensor_nd(v->info.dim);
+	assert(v_nd == 3 || v_nd == 4);
+	const int o_nd = ccv_nnc_tensor_nd(o->info.dim);
+	assert(o_nd == 3 || o_nd == 4);
+	assert(q_nd == k_nd && k_nd == v_nd && v_nd == o_nd);
+	if (is_varlen && q_nd != 4)
+		return CCV_NNC_EXEC_INVALID;
+	ccv_nnc_tensor_view_t* const lse = output_size > 1 ? (ccv_nnc_tensor_view_t*)outputs[1] : 0;
+
+	int qdim[CCV_NNC_MAX_DIM_ALLOC];
+	int kdim[CCV_NNC_MAX_DIM_ALLOC];
+	int vdim[CCV_NNC_MAX_DIM_ALLOC];
+	int odim[CCV_NNC_MAX_DIM_ALLOC];
+	int amdim[CCV_NNC_MAX_DIM_ALLOC];
+	ccv_nnc_tensor_view_get_dim(q, qdim);
+	ccv_nnc_tensor_view_get_dim(k, kdim);
+	ccv_nnc_tensor_view_get_dim(v, vdim);
+	ccv_nnc_tensor_view_get_dim(o, odim);
+
+	assert(q->info.format == CCV_TENSOR_FORMAT_NHWC);
+	assert(k->info.format == CCV_TENSOR_FORMAT_NHWC);
+	assert(v->info.format == CCV_TENSOR_FORMAT_NHWC);
+	assert(o->info.format == CCV_TENSOR_FORMAT_NHWC);
+	if (attn_mask) {
+		// MFA does not support fused transposes on the mask.
+		assert(attn_mask->info.format == CCV_TENSOR_FORMAT_NHWC);
+	}
+
+	assert(CCV_IS_TENSOR_CONTIGUOUS(q));
+	assert(CCV_IS_TENSOR_CONTIGUOUS(k));
+	assert(CCV_IS_TENSOR_CONTIGUOUS(v));
+	assert(CCV_IS_TENSOR_CONTIGUOUS(o));
+	if (is_varlen)
+	{
+		assert(q_seq_offsets->info.datatype == CCV_32S);
+		assert(kv_seq_offsets->info.datatype == CCV_32S);
+		assert(CCV_IS_TENSOR_CONTIGUOUS(q_seq_offsets));
+		assert(CCV_IS_TENSOR_CONTIGUOUS(kv_seq_offsets));
+	}
+
+	if (attn_mask) {
+		assert(CCV_IS_TENSOR_CONTIGUOUS(attn_mask));
+	}
+
+	int batch_size;
+	int R;
+	int C;
+	int Hq;
+	int Hk;
+	int D;
+	if (is_varlen) {
+		batch_size = ccv_nnc_tensor_count(q_seq_offsets->info) - 1;
+		assert(batch_size > 0);
+		assert(ccv_nnc_tensor_count(kv_seq_offsets->info) == batch_size + 1);
+		assert(cmd.info.scaled_dot_product_attention.max_seqlen_q > 0);
+		assert(cmd.info.scaled_dot_product_attention.max_seqlen_kv > 0);
+		assert(qdim[0] == 1);
+		assert(kdim[0] == 1);
+		assert(vdim[0] == 1);
+		assert(odim[0] == 1);
+		assert(odim[1] == qdim[1]);
+		R = cmd.info.scaled_dot_product_attention.max_seqlen_q;
+		C = cmd.info.scaled_dot_product_attention.max_seqlen_kv;
+		Hq = qdim[2];
+		Hk = kdim[2];
+		assert(Hq >= Hk);
+		assert((Hq % Hk) == 0);
+		D = qdim[3];
+		assert(D == kdim[3]);
+		assert(D == vdim[3]);
+		assert(D == odim[3]);
+		assert(kdim[1] == vdim[1]);
+		assert(Hk == vdim[2]);
+		assert(Hq == odim[2]);
+	} else if (q_nd == 3) {
+		batch_size = qdim[1];
+		assert(batch_size == kdim[1]);
+		R = qdim[2];
+		C = kdim[2];
+		Hq = 1;
+		Hk = 1;
+		D = qdim[3];
+		assert(D == kdim[3]);
+	} else if (q_nd == 4) {
+		batch_size = qdim[0];
+		assert(batch_size == kdim[0]);
+		R = qdim[1];
+		C = kdim[1];
+		Hq = qdim[2];
+		Hk = kdim[2];
+		assert(Hq >= Hk);
+		assert((Hq % Hk) == 0);
+		D = qdim[3];
+		assert(D == kdim[3]);
+	}
+	uint32_t sink_head_stride = 0;
+	if (attention_sinks)
+	{
+		assert(CCV_IS_TENSOR_CONTIGUOUS(sinks));
+		assert(sinks->info.datatype == q->info.datatype);
+		const int sink_count = ccv_nnc_tensor_count(sinks->info);
+		assert(sink_count == 1 || sink_count == Hq);
+		sink_head_stride = (sink_count == 1) ? 0 : 1;
+	}
+
+	if (attn_mask) {
+		// MFA can support am_nd == 2 and broadcast batch=1 -> batch=batch_size, but
+		// wait until that occurs in practice before doing so.
+		const int am_nd = ccv_nnc_tensor_nd(attn_mask->info.dim);
+		assert(am_nd == 3 || am_nd == 4); // [batch_size, R, C]
+
+		// MFA does not support attention mask broadcasting (where the R dimension
+		// of Q > 1, but the R dimension of the mask == 1).
+		ccv_nnc_tensor_view_get_dim(attn_mask, amdim);
+		if (am_nd == 3)
+		{
+			assert(amdim[1] == batch_size || amdim[1] == 1);
+			amdim[0] = amdim[1];
+			amdim[1] = 1;
+			assert(amdim[2] == R);
+			assert(amdim[3] == C);
+		} else {
+			assert(amdim[0] == batch_size || amdim[0] == 1);
+			assert(amdim[1] == 1);
+			assert(amdim[2] == R);
+			assert(amdim[3] == C);
+		}
+	}
+	int weights_datatype = 0;
+	int weights_qx_subtype = 0;
+	if (weights)
+	{
+		if (CCV_GET_DATA_TYPE(weights->info.datatype) == CCV_QX)
+		{
+			weights_datatype = (weights->info.datatype & 0xff) << 12;
+			weights_qx_subtype = weights->info.datatype & 0xf00;
+		} else
+			weights_datatype = weights->info.datatype;
+	}
+
+	const int is_same_dtype =
+		(q->info.datatype == k->info.datatype) &&
+		(q->info.datatype == v->info.datatype) &&
+		(q->info.datatype == o->info.datatype) &&
+		(attn_mask ? (q->info.datatype == attn_mask->info.datatype) : 1) &&
+		(weights ? (q->info.datatype == weights_datatype) : 1) &&
+		(bias ? (q->info.datatype == bias->info.datatype) : 1) &&
+		(sinks ? (q->info.datatype == sinks->info.datatype) : 1);
+	assert(is_same_dtype);
+
+	uint32_t mtl_data_type = UINT32_MAX;
+	switch (q->info.datatype) {
+		case CCV_16F: {
+			mtl_data_type = 16;
+			break;
+		}
+		case CCV_16BF: {
+			mtl_data_type = 121;
+			break;
+		}
+		case CCV_32F: {
+			mtl_data_type = 3;
+			break;
+		}
+		default: {
+			assert(false);
+			break;
+		}
+	}
+
+	@autoreleasepool {
+		ccv_nnc_mfa_context_t* context = ccv_nnc_default_mfa_context();
+		const int is_mfa_supported =
+			ccv_nnc_mfa_context_supported(context) && !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA) && !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_ATTENTION);
+		if (is_varlen && !is_mfa_supported)
+			return CCV_NNC_EXEC_INVALID;
+		if (attention_sinks && !is_mfa_supported)
+			return CCV_NNC_EXEC_INVALID;
+		if (sliding_window > 0 && !is_mfa_supported)
+			return CCV_NNC_EXEC_INVALID;
+		if (!is_mfa_supported && !attn_mask && !weights && !bias)
+		{
+			MPSCommandBuffer* command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+			// Use MPSGraph.
+			ccv_nnc_mps_graph_key_t key = ccv_nnc_mps_graph_key_new(cmd, 0, hint, flags, inputs, input_size, outputs, output_size);
+			// Key will be consumed by the next method, therefore, no need to free.
+			int indices[3];
+			int qstride[CCV_NNC_MAX_DIM_ALLOC];
+			int kstride[CCV_NNC_MAX_DIM_ALLOC];
+			int vstride[CCV_NNC_MAX_DIM_ALLOC];
+			int ostride[CCV_NNC_MAX_DIM_ALLOC];
+			ccv_nnc_tensor_view_get_stride(q, qstride);
+			ccv_nnc_tensor_view_get_stride(k, kstride);
+			ccv_nnc_tensor_view_get_stride(v, vstride);
+			ccv_nnc_tensor_view_get_stride(o, ostride);
+			int* qdim_r = qdim;
+			int* qstride_r = qstride;
+			int* kdim_r = kdim;
+			int* kstride_r = kstride;
+			int* vdim_r = vdim;
+			int* vstride_r = vstride;
+			const float scale = cmd.info.scaled_dot_product_attention.scale;
+			MPSGraphExecutable* executable = ccv_nnc_mps_graph_executable_cache(key, indices, ^void (MPSGraph* graph, NSMutableArray<MPSGraphTensor*>* inputTensors, NSMutableArray<MPSGraphShapedType*>* inputShapedTypes, NSMutableArray<MPSGraphTensor*>* resultTensors) {
+				MPSGraphTensor* mps_input_q;
+				MPSGraphTensor* mps_q = ccv_nnc_mps_graph_tensor_input(graph, q, qdim_r, qstride_r, &mps_input_q);
+				MPSGraphShapedType* mps_q_shape = ccv_nnc_mps_graph_tensor_input_shape(q, qdim_r, qstride_r);
+				MPSGraphTensor* mps_input_k;
+				MPSGraphTensor* mps_k = ccv_nnc_mps_graph_tensor_input(graph, k, kdim_r, kstride_r, &mps_input_k);
+				MPSGraphShapedType* mps_k_shape = ccv_nnc_mps_graph_tensor_input_shape(k, kdim_r, kstride_r);
+				MPSGraphTensor* mps_input_v;
+				MPSGraphTensor* mps_v = ccv_nnc_mps_graph_tensor_input(graph, v, vdim_r, vstride_r, &mps_input_v);
+				MPSGraphShapedType* mps_v_shape = ccv_nnc_mps_graph_tensor_input_shape(v, vdim_r, vstride_r);
+				[inputTensors addObject:mps_input_q];
+				[inputShapedTypes addObject:mps_q_shape];
+				[inputTensors addObject:mps_input_k];
+				[inputShapedTypes addObject:mps_k_shape];
+				[inputTensors addObject:mps_input_v];
+				[inputShapedTypes addObject:mps_v_shape];
+				mps_q = [graph transposeTensor:mps_q dimension:1 withDimension:2 name:nil];
+				mps_k = [graph transposeTensor:mps_k dimension:1 withDimension:2 name:nil];
+				mps_v = [graph transposeTensor:mps_v dimension:1 withDimension:2 name:nil];
+				MPSGraphTensor* mps_o = [graph scaledDotProductAttentionWithQueryTensor:mps_q keyTensor:mps_k valueTensor:mps_v scale:scale name:nil];
+				mps_o = [graph transposeTensor:mps_o dimension:1 withDimension:2 name:nil];
+				[resultTensors addObject:mps_o];
+			});
+			MPSGraphTensorData* data_q = ccv_nnc_mps_graph_tensor_data(q, qdim, qstride);
+			MPSGraphTensorData* data_k = ccv_nnc_mps_graph_tensor_data(k, kdim, kstride);
+			MPSGraphTensorData* data_v = ccv_nnc_mps_graph_tensor_data(v, vdim, vstride);
+			MPSGraphTensorData* data[] = {data_q, data_k, data_v};
+			ccv_nnc_mps_graph_executable_result(executable, command_buffer, @[data[indices[0]], data[indices[1]], data[indices[2]]], &o, (int*[]){ o->info.dim }, (int*[]){ o->stride }, 1, 0);
+			ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+			return CCV_NNC_EXEC_SUCCESS;
+		}
+
+		const int attention_flags = cmd.info.scaled_dot_product_attention.flags;
+		// 8I alone keeps the former 8I | 16F precision; 32F opts into FP32 intermediates.
+		const int is_downcast = q->info.datatype == CCV_16F &&
+			((attention_flags & CCV_NNC_GEMM_16F) || ((attention_flags & CCV_NNC_GEMM_8I) && !(attention_flags & CCV_NNC_GEMM_32F)));
+		// NAAttention lowers the head tile to the matmul2d N dimension, which MPP
+		// requires to be a multiple of 8 or 16.
+		const int use_neural_accelerators =
+			!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_NEURAL_ACCELERATORS) &&
+			ccv_nnc_mfa_has_neural_accelerators(context) &&
+			(mtl_data_type != 121 || ccv_nnc_mfa_neural_accelerators_support_bfloat(context)) &&
+			(D > 128 || (D % 8) == 0);
+		const int use_quantized_attention =
+			use_neural_accelerators &&
+			(attention_flags & CCV_NNC_GEMM_8I) &&
+			!weights &&
+			!bias;
+		if (sliding_window > 0 && use_quantized_attention)
+			return CCV_NNC_EXEC_INVALID;
+		int attention_is_batched = (batch_size > 1);
+		ccv_nnc_mfa_attention_params_t params = {
+			.type = 0,
+			.data_type = mtl_data_type,
+			.R = (uint32_t)R,
+			.C = (uint32_t)C,
+			.Hq = (uint32_t)Hq,
+			.Hk = (uint32_t)Hk,
+			.D = (uint32_t)D,
+			.output_rows = (uint32_t)(is_varlen ? qdim[1] : R * batch_size),
+			.Q_trans = false,
+			.K_trans = true,
+			.V_trans = false,
+			.O_trans = false,
+			.alpha = cmd.info.scaled_dot_product_attention.scale,
+			.batched = (attention_is_batched ? 1 : 0),
+			.masked = (attn_mask != NULL ? 1 : 0),
+			.is_causal = cmd.info.scaled_dot_product_attention.is_causal,
+			.is_varlen = is_varlen,
+			.upcast = !is_downcast,
+			.use_neural_accelerators = use_neural_accelerators,
+			.use_quantized_attention = use_quantized_attention,
+			.quantize_pv = !(attention_flags & (CCV_NNC_GEMM_16F | CCV_NNC_GEMM_32F)),
+			.use_hadamard = cmd.info.scaled_dot_product_attention.use_hadamard != 0,
+			.attention_sinks = attention_sinks,
+			.sliding_window = (uint32_t)sliding_window,
+			.sink_head_stride = sink_head_stride,
+
+			.batch_dims_q = { 0 },
+			.batch_dims_mask = { 0 },
+		};
+		if (attention_is_batched) {
+			params.batch_dims_q[0] = batch_size;
+			params.batch_dims_q[1] = 0;
+			params.batch_dims_mask[0] = attn_mask ? amdim[0] : batch_size;
+			params.batch_dims_mask[1] = 0;
+		}
+		ccv_nnc_mfa_prepare_attention(context, params);
+
+		mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+		mtl_buffer_t* mask_buffer = NULL;
+		if (params.masked) {
+			mask_buffer = mpgetbuffer((ccv_nnc_tensor_t*)attn_mask);
+		}
+		mtl_buffer_t* tensors[10] = {
+			mpgetbuffer((ccv_nnc_tensor_t*)q),
+			mpgetbuffer((ccv_nnc_tensor_t*)k),
+			mpgetbuffer((ccv_nnc_tensor_t*)v),
+			mpgetbuffer((ccv_nnc_tensor_t*)o),
+			mask_buffer,
+			lse ? mpgetbuffer((ccv_nnc_tensor_t*)lse) : 0,
+			is_varlen ? mpgetbuffer((ccv_nnc_tensor_t*)q_seq_offsets) : 0,
+			is_varlen ? mpgetbuffer((ccv_nnc_tensor_t*)kv_seq_offsets) : 0,
+			attention_sinks ? mpgetbuffer((ccv_nnc_tensor_t*)sinks) : 0,
+			NULL,
+		};
+		size_t tensor_offsets[9] = {
+			q->dataof,
+			k->dataof,
+			v->dataof,
+			o->dataof,
+			attn_mask ? attn_mask->dataof : 0,
+			lse ? lse->dataof : 0,
+			is_varlen ? q_seq_offsets->dataof : 0,
+			is_varlen ? kv_seq_offsets->dataof : 0,
+			attention_sinks ? sinks->dataof : 0,
+		};
+		ccv_nnc_mfa_encode_attention(context, params, command_batch, tensors, tensor_offsets);
+
+		// NNC notation:
+		// D = C * W^T + bias
+		//
+		// MFA notation:
+		// A <- O
+		// B <- feedforward weights
+		// D <- bias
+		// C = A * B^T + D
+		//
+		// For MFA, C is the output of GEMM, not the output of attention. D stands for
+		// "data" (arbitrary user-defined data). In this case, the user-defined data
+		// is the bias vector.
+		if (weights) {
+			int *adim = odim;
+			ccv_nnc_tensor_view_t* const a = o; // left input matrix
+			ccv_nnc_tensor_view_t* const b = weights; // weights
+			ccv_nnc_tensor_view_t* const c = (ccv_nnc_tensor_view_t*)outputs[0];
+
+			const int b_nd = ccv_nnc_tensor_nd(weights->info.dim);
+			assert(b_nd == 2);
+			assert(CCV_IS_TENSOR_CONTIGUOUS(c));
+			const int c_nd = ccv_nnc_tensor_nd(c->info.dim);
+			assert(c_nd == 3);
+
+			int cdim[CCV_NNC_MAX_DIM_ALLOC];
+			ccv_nnc_tensor_view_get_dim(c, cdim);
+
+			const int attention_batch_size = batch_size;
+			const int gemm_batch_size = cdim[1];
+			int gemm_is_batched = (gemm_batch_size > 1);
+			if (attention_is_batched) {
+				assert(gemm_is_batched);
+				assert(attention_batch_size == gemm_batch_size);
+			}
+			if (!gemm_is_batched) {
+				assert(!attention_is_batched);
+			}
+
+			// The C matrix of the GEMM cannot be transposed, so the assume the C matrix
+			// is NHWC.
+			assert(c->info.format == CCV_TENSOR_FORMAT_NHWC);
+			int M = cdim[1] * cdim[2];
+			int N = cdim[3];
+			int K = Hk * D;
+
+			if (o_nd == 3)
+			{
+				assert(adim[1] == attention_batch_size);
+				assert(adim[1] * adim[2] == M);
+			} else {
+				assert(adim[0] == attention_batch_size);
+				assert(adim[0] * adim[1] == M);
+			}
+			if (Hk > 1) {
+				assert(adim[2] * adim[3] == K);
+			} else {
+				assert(adim[3] == K);
+			}
+
+			// We assume the weights matrix is square.
+			assert(K == N);
+			assert(b->info.dim[0] == N);
+			assert(b->info.dim[1] == K);
+			assert(CCV_IS_TENSOR_CONTIGUOUS(b));
+
+			if (bias) {
+				const int bias_nd = ccv_nnc_tensor_nd(bias->info.dim);
+
+				// Since the weights matrix doesn't have a batch dimension, the bias
+				// vector doesn't either.
+				assert(bias_nd == 1);
+				assert(CCV_IS_TENSOR_CONTIGUOUS(bias));
+				assert(bias->info.dim[0] == N);
+			}
+			const int use_scaled_gemm =
+				(weights_qx_subtype == CCV_NNC_QX_8I_ROWWISE) &&
+				(CCV_GET_DATA_TYPE(a->info.datatype) != CCV_QX) &&
+				(CCV_GET_DATA_TYPE(c->info.datatype) != CCV_QX) &&
+				(!bias || CCV_GET_DATA_TYPE(bias->info.datatype) != CCV_QX) &&
+				ccv_nnc_mfa_context_supported(context) &&
+				!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA) &&
+				!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_GEMM) &&
+				!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_NEURAL_ACCELERATORS) &&
+				ccv_nnc_mfa_has_neural_accelerators(context) &&
+				(mtl_data_type != 121 || ccv_nnc_mfa_neural_accelerators_support_bfloat(context));
+			if (use_scaled_gemm)
+			{
+				ccv_nnc_mfa_scaled_gemm_params_t params = {
+					.data_type = mtl_data_type,
+					.M = (uint32_t)M,
+					.N = (uint32_t)N,
+					.K = (uint32_t)K,
+					.fused_bias = (bias ? 1 : 0),
+					.use_neural_accelerators = 1,
+					.batch_dimension = 1,
+					.batch_stride_a = 0,
+					.batch_stride_b = 0,
+					.batch_stride_c = 0,
+					.batch_stride_d = 0,
+				};
+				ccv_nnc_mfa_prepare_scaled_gemm(context, params);
+				mtl_buffer_t* bias_buffer = NULL;
+				if (bias)
+					bias_buffer = mpgetbuffer((ccv_nnc_tensor_t*)bias);
+				mtl_buffer_t* tensors[5] = {
+					mpgetbuffer((ccv_nnc_tensor_t*)a), // A
+					mpgetbuffer((ccv_nnc_tensor_t*)weights), // B
+					mpgetbuffer((ccv_nnc_tensor_t*)c), // C
+					bias_buffer, // D
+					NULL,
+				};
+				size_t tensor_offsets[4] = {
+					a->dataof, // A offset
+					weights->dataof, // B offset
+					c->dataof, // C offset
+					bias ? bias->dataof : 0, // D offset
+				};
+				ccv_nnc_mfa_encode_scaled_gemm(context, params, command_batch, tensors, tensor_offsets);
+			} else {
+				mtl_buffer_t* weights_data = mpgetbuffer((ccv_nnc_tensor_t*)weights);
+				size_t weights_dataof = (size_t)mpgetoffset((ccv_nnc_tensor_t*)weights);
+				ccv_nnc_mfa_gemm_params_t params = {
+					.data_type = mtl_data_type,
+					.M = (uint32_t)M,
+					.N = (uint32_t)N,
+					.K = (uint32_t)K,
+					.A_trans = false,
+					.B_trans = true,
+					.D_trans = false,
+					.fused_bias = (bias ? 1 : 0),
+					.register_float = (is_downcast ? 0 : 1),
+					.use_neural_accelerators = !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_NEURAL_ACCELERATORS) && ccv_nnc_mfa_has_neural_accelerators(context) && (mtl_data_type != 121 || ccv_nnc_mfa_neural_accelerators_support_bfloat(context)),
+
+					.batch_dimension = 1,
+					.batch_stride_a = 0,
+					.batch_stride_b = 0,
+					.batch_stride_c = 0,
+					.batch_stride_d = 0,
+				};
+				const size_t scratch_offset = ccv_nnc_mfa_gemm_reserved_scratch_size(params);
+				if (CCV_GET_DATA_TYPE(weights->info.datatype) == CCV_QX)
+				{
+					const size_t weights_data_size = _ccv_nnc_qx_dense_data_size(weights->info);
+					ccv_nnc_mfa_qx_decode_params_t weights_decode_params = _ccv_nnc_mfa_qx_decode_params(weights->info, mtl_data_type);
+					_ccv_nnc_mfa_prepare_qx_decode(context, weights_decode_params);
+					weights_data = ccv_nnc_mfa_request_scratch(context, scratch_offset + weights_data_size);
+					weights_dataof = scratch_offset;
+					_ccv_nnc_mfa_encode_qx_decode(context, weights_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)weights), weights->dataof, (mtl_buffer_t*)weights_data, scratch_offset);
+				}
+				ccv_nnc_mfa_prepare_gemm(context, params);
+
+				mtl_buffer_t* bias_buffer = NULL;
+				if (bias) {
+					bias_buffer = mpgetbuffer((ccv_nnc_tensor_t*)bias);
+				}
+				mtl_buffer_t* tensors[5] = {
+					mpgetbuffer((ccv_nnc_tensor_t*)a), // A
+					weights_data, // B
+					mpgetbuffer((ccv_nnc_tensor_t*)c), // C
+					bias_buffer, // D
+					NULL,
+				};
+				size_t tensor_offsets[4] = {
+					a->dataof, // A offset
+					weights_dataof, // B offset
+					c->dataof, // C offset
+					bias ? bias->dataof : 0, // D offset
+				};
+				ccv_nnc_mfa_encode_gemm(context, params, command_batch, tensors, tensor_offsets);
+			}
+			}
+
+		ccv_nnc_stream_context_finish_command_batch(stream_context, command_batch);
+	}
+	return CCV_NNC_EXEC_SUCCESS;
+}
+
+static int _ccv_nnc_scaled_dot_product_attention_back(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint, const int flags, ccv_nnc_tensor_t* const* const inputs, const int input_size, ccv_nnc_tensor_t* const* const outputs, const int output_size, ccv_nnc_stream_context_t* const stream_context)
+{
+	assert(input_size >= 6);
+	assert(output_size >= 3);
+	if (cmd.info.scaled_dot_product_attention.is_varlen)
+		return CCV_NNC_EXEC_INVALID;
+	if (cmd.info.scaled_dot_product_attention.attention_sinks)
+		return CCV_NNC_EXEC_INVALID;
+	if (cmd.info.scaled_dot_product_attention.sliding_window != 0)
+		return CCV_NNC_EXEC_INVALID;
+	assert(!cmd.info.scaled_dot_product_attention.is_causal);
+	ccv_nnc_tensor_view_t* const g = (ccv_nnc_tensor_view_t*)inputs[0];
+	ccv_nnc_tensor_view_t* const q = (ccv_nnc_tensor_view_t*)inputs[3];
+	ccv_nnc_tensor_view_t* const k = (ccv_nnc_tensor_view_t*)inputs[4];
+	ccv_nnc_tensor_view_t* const v = (ccv_nnc_tensor_view_t*)inputs[5];
+	ccv_nnc_tensor_view_t* const o = input_size > 9 ? (ccv_nnc_tensor_view_t*)inputs[9] : 0;
+	ccv_nnc_tensor_view_t* const lse = input_size > 10 ? (ccv_nnc_tensor_view_t*)inputs[10] : 0;
+	ccv_nnc_tensor_view_t* const dq = (ccv_nnc_tensor_view_t*)outputs[0];
+	ccv_nnc_tensor_view_t* const dk = (ccv_nnc_tensor_view_t*)outputs[1];
+	ccv_nnc_tensor_view_t* const dv = (ccv_nnc_tensor_view_t*)outputs[2];
+	const int q_nd = ccv_nnc_tensor_nd(q->info.dim);
+	assert(q_nd == 3 || q_nd == 4);
+	const int k_nd = ccv_nnc_tensor_nd(k->info.dim);
+	assert(k_nd == 3 || k_nd == 4);
+	const int v_nd = ccv_nnc_tensor_nd(v->info.dim);
+	assert(v_nd == 3 || v_nd == 4);
+	const int g_nd = ccv_nnc_tensor_nd(g->info.dim);
+	assert(g_nd == 3 || g_nd == 4);
+	const int dq_nd = ccv_nnc_tensor_nd(dq->info.dim);
+	assert(dq_nd == 3 || dq_nd == 4);
+	assert(dq_nd == q_nd);
+	const int dk_nd = ccv_nnc_tensor_nd(dk->info.dim);
+	assert(dk_nd == 3 || dk_nd == 4);
+	assert(dk_nd == k_nd);
+	const int dv_nd = ccv_nnc_tensor_nd(dv->info.dim);
+	assert(dv_nd == 3 || dv_nd == 4);
+	assert(dv_nd == v_nd);
+	assert(q_nd == k_nd && k_nd == v_nd && v_nd == g_nd);
+	// Assuming this is float 32.
+	int qdim[CCV_NNC_MAX_DIM_ALLOC];
+	int kdim[CCV_NNC_MAX_DIM_ALLOC];
+	int vdim[CCV_NNC_MAX_DIM_ALLOC];
+	int gdim[CCV_NNC_MAX_DIM_ALLOC];
+	int dqdim[CCV_NNC_MAX_DIM_ALLOC];
+	int dkdim[CCV_NNC_MAX_DIM_ALLOC];
+	int dvdim[CCV_NNC_MAX_DIM_ALLOC];
+	ccv_nnc_tensor_view_get_dim(q, qdim);
+	ccv_nnc_tensor_view_get_dim(k, kdim);
+	ccv_nnc_tensor_view_get_dim(v, vdim);
+	ccv_nnc_tensor_view_get_dim(g, gdim);
+	ccv_nnc_tensor_view_get_dim(dq, dqdim);
+	ccv_nnc_tensor_view_get_dim(dk, dkdim);
+	ccv_nnc_tensor_view_get_dim(dv, dvdim);
+	if (q_nd == 3)
+	{
+		qdim[0] = qdim[1], qdim[1] = qdim[2], qdim[2] = 1;
+		kdim[0] = kdim[1], kdim[1] = kdim[2], kdim[2] = 1;
+		vdim[0] = vdim[1], vdim[1] = vdim[2], vdim[2] = 1;
+		gdim[0] = gdim[1], gdim[1] = gdim[2], gdim[2] = 1;
+		dqdim[0] = dqdim[1], dqdim[1] = dqdim[2], dqdim[2] = 1;
+		dkdim[0] = dkdim[1], dkdim[1] = dkdim[2], dkdim[2] = 1;
+		dvdim[0] = dvdim[1], dvdim[1] = dvdim[2], dvdim[2] = 1;
+	}
+	assert(qdim[0] == kdim[0] && kdim[0] == vdim[0] && vdim[0] == gdim[0]);
+	assert(qdim[2] == gdim[2]);
+	assert(kdim[2] == vdim[2]);
+	assert(qdim[2] % kdim[2] == 0);
+	assert(qdim[2] >= kdim[2]);
+	assert(qdim[3] == kdim[3]);
+	assert(kdim[1] == vdim[1]);
+	assert(gdim[1] == qdim[1]);
+	assert(gdim[3] == vdim[3]);
+	assert(CCV_NNC_MAX_DIM == 2); // Need to change this logic for CCV_NNC_MAX_DIM == other number.
+	int qstride[CCV_NNC_MAX_DIM_ALLOC];
+	int kstride[CCV_NNC_MAX_DIM_ALLOC];
+	int vstride[CCV_NNC_MAX_DIM_ALLOC];
+	int gstride[CCV_NNC_MAX_DIM_ALLOC];
+	int dqstride[CCV_NNC_MAX_DIM_ALLOC];
+	int dkstride[CCV_NNC_MAX_DIM_ALLOC];
+	int dvstride[CCV_NNC_MAX_DIM_ALLOC];
+	ccv_nnc_tensor_view_get_stride(q, qstride);
+	ccv_nnc_tensor_view_get_stride(k, kstride);
+	ccv_nnc_tensor_view_get_stride(v, vstride);
+	ccv_nnc_tensor_view_get_stride(g, gstride);
+	ccv_nnc_tensor_view_get_stride(dq, dqstride);
+	ccv_nnc_tensor_view_get_stride(dk, dkstride);
+	ccv_nnc_tensor_view_get_stride(dv, dvstride);
+	if (q_nd == 3)
+	{
+		qstride[0] = qstride[1], qstride[1] = qstride[2], qstride[2] = qstride[3];
+		kstride[0] = kstride[1], kstride[1] = kstride[2], kstride[2] = kstride[3];
+		vstride[0] = vstride[1], vstride[1] = vstride[2], vstride[2] = vstride[3];
+		gstride[0] = gstride[1], gstride[1] = gstride[2], gstride[2] = gstride[3];
+		dqstride[0] = dqstride[1], dqstride[1] = dqstride[2], dqstride[2] = dqstride[3];
+		dkstride[0] = dkstride[1], dkstride[1] = dkstride[2], dkstride[2] = dkstride[3];
+		dvstride[0] = dvstride[1], dvstride[1] = dvstride[2], dvstride[2] = dvstride[3];
+	}
+	@autoreleasepool {
+		ccv_nnc_mfa_context_t* context = ccv_nnc_default_mfa_context();
+		const int is_contiguous =
+			(!CCV_IS_TENSOR_VIEW(q) || ccv_nnc_tensor_view_is_contiguous(qdim, qstride)) &&
+			(!CCV_IS_TENSOR_VIEW(k) || ccv_nnc_tensor_view_is_contiguous(kdim, kstride)) &&
+			(!CCV_IS_TENSOR_VIEW(v) || ccv_nnc_tensor_view_is_contiguous(vdim, vstride)) &&
+			(!CCV_IS_TENSOR_VIEW(g) || ccv_nnc_tensor_view_is_contiguous(gdim, gstride)) &&
+			(!CCV_IS_TENSOR_VIEW(dq) || ccv_nnc_tensor_view_is_contiguous(dqdim, dqstride)) &&
+			(!CCV_IS_TENSOR_VIEW(dk) || ccv_nnc_tensor_view_is_contiguous(dkdim, dkstride)) &&
+			(!CCV_IS_TENSOR_VIEW(dv) || ccv_nnc_tensor_view_is_contiguous(dvdim, dvstride)) &&
+			(o ? (!CCV_IS_TENSOR_VIEW(o) || ccv_nnc_tensor_view_is_contiguous(o->info.dim, o->stride)) : 1) &&
+			(lse ? (!CCV_IS_TENSOR_VIEW(lse) || ccv_nnc_tensor_view_is_contiguous(lse->info.dim, lse->stride)) : 1);
+		const int is_same_dtype =
+			(q->info.datatype == k->info.datatype) &&
+			(k->info.datatype == v->info.datatype) &&
+			(v->info.datatype == g->info.datatype) &&
+			(g->info.datatype == dq->info.datatype) &&
+			(dq->info.datatype == dk->info.datatype) &&
+			(dk->info.datatype == dv->info.datatype) &&
+			(o ? (g->info.datatype == o->info.datatype) : 1);
+		const int is_supported_dtype = q->info.datatype == CCV_16F || q->info.datatype == CCV_32F || q->info.datatype == CCV_16BF;
+		uint32_t mtl_data_type = UINT32_MAX;
+		switch (q->info.datatype) {
+			case CCV_16F: {
+				mtl_data_type = 16;
+				break;
+			}
+			case CCV_16BF: {
+				mtl_data_type = 121;
+				break;
+			}
+			case CCV_32F: {
+				mtl_data_type = 3;
+				break;
+			}
+			default: {
+				assert(false);
+				break;
+			}
+		}
+		int batch_size;
+		int R;
+		int C;
+		int Hq;
+		int Hk;
+		int D;
+		if (q_nd == 3) {
+			batch_size = qdim[1];
+			assert(batch_size == kdim[1]);
+			R = qdim[2];
+			C = kdim[2];
+			Hq = 1;
+			Hk = 1;
+			D = qdim[3];
+			assert(D == kdim[3]);
+		} else if (q_nd == 4) {
+			batch_size = qdim[0];
+			assert(batch_size == kdim[0]);
+			R = qdim[1];
+			C = kdim[1];
+			Hq = qdim[2];
+			Hk = kdim[2];
+			assert(Hq >= Hk);
+			assert((Hq % Hk) == 0);
+			D = qdim[3];
+			assert(D == kdim[3]);
+		}
+		const int is_mfa_supported =
+			ccv_nnc_mfa_context_supported(context) && is_contiguous && is_same_dtype && is_supported_dtype && !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA) && !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_ATTENTION);
+		if (is_mfa_supported)
+		{
+			const int o_nd = ccv_nnc_tensor_nd(o->info.dim);
+			assert(o_nd == 3 || o_nd == 4);
+			int odim[CCV_NNC_MAX_DIM_ALLOC];
+			ccv_nnc_tensor_view_get_dim(o, odim);
+			if (o_nd == 3)
+				odim[0] = odim[1], odim[1] = odim[2], odim[2] = 1;
+			const int attention_flags = cmd.info.scaled_dot_product_attention.flags;
+			// 8I alone keeps the former 8I | 16F precision; 32F opts into FP32 intermediates.
+			const int is_downcast = q->info.datatype == CCV_16F &&
+				((attention_flags & CCV_NNC_GEMM_16F) || ((attention_flags & CCV_NNC_GEMM_8I) && !(attention_flags & CCV_NNC_GEMM_32F)));
+			int attention_is_batched = (batch_size > 1);
+			ccv_nnc_mfa_attention_params_t params = {
+				.type = 1, // 1 is backward query / key value.
+				.data_type = mtl_data_type,
+				.R = (uint32_t)R,
+				.C = (uint32_t)C,
+				.Hq = (uint32_t)Hq,
+				.Hk = (uint32_t)Hk,
+				.D = (uint32_t)D,
+				.Q_trans = false,
+				.K_trans = false,
+				.V_trans = false,
+				.O_trans = false,
+				.alpha = cmd.info.scaled_dot_product_attention.scale,
+				.batched = (attention_is_batched ? 1 : 0),
+				.masked = 0,
+				.upcast = !is_downcast,
+				.use_neural_accelerators = !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_NEURAL_ACCELERATORS) && ccv_nnc_mfa_has_neural_accelerators(context) && (mtl_data_type != 121 || ccv_nnc_mfa_neural_accelerators_support_bfloat(context)),
+				.use_quantized_attention = (attention_flags & CCV_NNC_GEMM_8I) != 0,
+				.quantize_pv = 1, // Floating PV is a forward-only option.
+				.use_hadamard = cmd.info.scaled_dot_product_attention.use_hadamard != 0,
+
+				.batch_dims_q = { 0 },
+				.batch_dims_mask = { 0 },
+			};
+			if (attention_is_batched) {
+				params.batch_dims_q[0] = batch_size;
+				params.batch_dims_q[1] = 0;
+				params.batch_dims_mask[0] = batch_size;
+				params.batch_dims_mask[1] = 0;
+			}
+			ccv_nnc_mfa_prepare_attention(context, params);
+
+			mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+			mtl_buffer_t* tensors[10] = {
+				mpgetbuffer((ccv_nnc_tensor_t*)q),
+				mpgetbuffer((ccv_nnc_tensor_t*)k),
+				mpgetbuffer((ccv_nnc_tensor_t*)v),
+				mpgetbuffer((ccv_nnc_tensor_t*)o),
+				lse ? mpgetbuffer((ccv_nnc_tensor_t*)lse) : 0,
+				mpgetbuffer((ccv_nnc_tensor_t*)g),
+				mpgetbuffer((ccv_nnc_tensor_t*)dq),
+				mpgetbuffer((ccv_nnc_tensor_t*)dk),
+				mpgetbuffer((ccv_nnc_tensor_t*)dv),
+				NULL,
+			};
+			size_t tensor_offsets[9] = {
+				q->dataof,
+				k->dataof,
+				v->dataof,
+				o->dataof,
+				lse ? lse->dataof : 0,
+				g->dataof,
+				dq->dataof,
+				dk->dataof,
+				dv->dataof
+			};
+			ccv_nnc_mfa_encode_attention(context, params, command_batch, tensors, tensor_offsets);
+			ccv_nnc_stream_context_finish_command_batch(stream_context, command_batch);
+		} else {
+			MPSCommandBuffer* command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+			ccv_nnc_mps_graph_key_t key = ccv_nnc_mps_graph_key_new(cmd, 0, hint, flags, inputs, input_size, outputs, output_size);
+			int indices[4];
+			const int* gdim_r = gdim;
+			const int* gstride_r = gstride;
+			const int* qdim_r = qdim;
+			const int* qstride_r = qstride;
+			const int* kdim_r = kdim;
+			const int* kstride_r = kstride;
+			const int* vdim_r = vdim;
+			const int* vstride_r = vstride;
+			const float scale = cmd.info.scaled_dot_product_attention.scale;
+
+			MPSGraphExecutable* executable = ccv_nnc_mps_graph_executable_cache(key, indices, ^void (MPSGraph* graph, NSMutableArray<MPSGraphTensor*>* inputTensors, NSMutableArray<MPSGraphShapedType*>* inputShapedTypes, NSMutableArray<MPSGraphTensor*>* resultTensors) {
+				MPSGraphTensor* mps_input_g;
+				MPSGraphTensor* mps_g = ccv_nnc_mps_graph_tensor_input(graph, g, gdim_r, gstride_r, &mps_input_g);
+				[inputTensors addObject:mps_input_g];
+				MPSGraphShapedType* mps_g_shape = ccv_nnc_mps_graph_tensor_input_shape(g, gdim_r, gstride_r);
+				[inputShapedTypes addObject:mps_g_shape];
+
+				MPSGraphTensor* mps_input_q;
+				MPSGraphTensor* mps_q = ccv_nnc_mps_graph_tensor_input(graph, q, qdim_r, qstride_r, &mps_input_q);
+				[inputTensors addObject:mps_input_q];
+				MPSGraphShapedType* mps_q_shape = ccv_nnc_mps_graph_tensor_input_shape(q, qdim_r, qstride_r);
+				[inputShapedTypes addObject:mps_q_shape];
+
+				MPSGraphTensor* mps_input_k;
+				MPSGraphTensor* mps_k = ccv_nnc_mps_graph_tensor_input(graph, k, kdim_r, kstride_r, &mps_input_k);
+				[inputTensors addObject:mps_input_k];
+				MPSGraphShapedType* mps_k_shape = ccv_nnc_mps_graph_tensor_input_shape(k, kdim_r, kstride_r);
+				[inputShapedTypes addObject:mps_k_shape];
+
+				MPSGraphTensor* mps_input_v;
+				MPSGraphTensor* mps_v = ccv_nnc_mps_graph_tensor_input(graph, v, vdim_r, vstride_r, &mps_input_v);
+				[inputTensors addObject:mps_input_v];
+				MPSGraphShapedType* mps_v_shape = ccv_nnc_mps_graph_tensor_input_shape(v, vdim_r, vstride_r);
+				[inputShapedTypes addObject:mps_v_shape];
+
+				MPSGraphTensor* mps_scale = [graph constantWithScalar:scale dataType:ccv_nnc_mps_datatype(q->info.datatype)];
+				mps_q = [graph multiplicationWithPrimaryTensor:mps_scale secondaryTensor:[graph transposeTensor:mps_q dimension:1 withDimension:2 name:nil] name:nil];
+				mps_k = [graph transposeTensor:mps_k dimension:1 withDimension:2 name:nil];
+				mps_v = [graph transposeTensor:mps_v dimension:1 withDimension:2 name:nil];
+				mps_g = [graph transposeTensor:mps_g dimension:1 withDimension:2 name:nil];
+				MPSGraphTensor* mps_dq;
+				MPSGraphTensor* mps_dk;
+				MPSGraphTensor* mps_dv;
+				if (Hq == Hk)
+				{
+					MPSGraphTensor* mps_kt = [graph transposeTensor:mps_k dimension:2 withDimension:3 name:nil];
+					MPSGraphTensor* mps_qk = [graph matrixMultiplicationWithPrimaryTensor:mps_q secondaryTensor:mps_kt name:nil];
+					MPSGraphTensor* mps_softmax = [graph softMaxWithTensor:mps_qk axis:3 name:nil];
+					MPSGraphTensor* mps_softmaxt = [graph transposeTensor:mps_softmax dimension:2 withDimension:3 name:nil];
+					mps_dv = [graph matrixMultiplicationWithPrimaryTensor:mps_softmaxt secondaryTensor:mps_g name:nil];
+					mps_v = [graph transposeTensor:mps_v dimension:2 withDimension:3 name:nil];
+					MPSGraphTensor* mps_dsoftmax = [graph matrixMultiplicationWithPrimaryTensor:mps_g secondaryTensor:mps_v name:nil];
+					MPSGraphTensor* mulTensor = [graph multiplicationWithPrimaryTensor:mps_softmax secondaryTensor:mps_dsoftmax name:nil];
+					MPSGraphTensor* mulSumTensor = [graph reductionSumWithTensor:mulTensor axis:-1 name:nil];
+					MPSGraphTensor* gradSubTensor = [graph subtractionWithPrimaryTensor:mps_dsoftmax secondaryTensor:mulSumTensor name:nil];
+					MPSGraphTensor* mps_dqk = [graph multiplicationWithPrimaryTensor:mps_softmax secondaryTensor:gradSubTensor name:nil];
+					mps_dq = [graph multiplicationWithPrimaryTensor:mps_scale secondaryTensor:[graph matrixMultiplicationWithPrimaryTensor:mps_dqk secondaryTensor:mps_k name:nil] name:nil];
+					mps_dqk = [graph transposeTensor:mps_dqk dimension:2 withDimension:3 name:nil];
+					mps_dk = [graph matrixMultiplicationWithPrimaryTensor:mps_dqk secondaryTensor:mps_q name:nil];
+				} else {
+					const int query_group_size = Hq / Hk;
+					mps_q = [graph reshapeTensor:mps_q withShape:@[@(batch_size), @(Hk), @(query_group_size), @(R), @(D)] name:nil];
+					mps_k = [graph reshapeTensor:mps_k withShape:@[@(batch_size), @(Hk), @1, @(C), @(D)] name:nil];
+					mps_v = [graph reshapeTensor:mps_v withShape:@[@(batch_size), @(Hk), @1, @(C), @(D)] name:nil];
+					mps_g = [graph reshapeTensor:mps_g withShape:@[@(batch_size), @(Hk), @(query_group_size), @(R), @(D)] name:nil];
+					MPSGraphTensor* mps_kt = [graph transposeTensor:mps_k dimension:3 withDimension:4 name:nil];
+					MPSGraphTensor* mps_qk = [graph matrixMultiplicationWithPrimaryTensor:mps_q secondaryTensor:mps_kt name:nil];
+					MPSGraphTensor* mps_softmax = [graph softMaxWithTensor:mps_qk axis:4 name:nil];
+					MPSGraphTensor* mps_vt = [graph transposeTensor:mps_v dimension:3 withDimension:4 name:nil];
+					MPSGraphTensor* mps_dsoftmax = [graph matrixMultiplicationWithPrimaryTensor:mps_g secondaryTensor:mps_vt name:nil];
+					MPSGraphTensor* mulTensor = [graph multiplicationWithPrimaryTensor:mps_softmax secondaryTensor:mps_dsoftmax name:nil];
+					MPSGraphTensor* mulSumTensor = [graph reductionSumWithTensor:mulTensor axis:-1 name:nil];
+					MPSGraphTensor* gradSubTensor = [graph subtractionWithPrimaryTensor:mps_dsoftmax secondaryTensor:mulSumTensor name:nil];
+					MPSGraphTensor* mps_dqk = [graph multiplicationWithPrimaryTensor:mps_softmax secondaryTensor:gradSubTensor name:nil];
+					mps_dq = [graph multiplicationWithPrimaryTensor:mps_scale secondaryTensor:[graph matrixMultiplicationWithPrimaryTensor:mps_dqk secondaryTensor:mps_k name:nil] name:nil];
+					mps_dq = [graph reshapeTensor:mps_dq withShape:@[@(batch_size), @(Hq), @(R), @(D)] name:nil];
+
+					MPSGraphTensor* mps_softmaxt = [graph transposeTensor:mps_softmax dimension:3 withDimension:4 name:nil];
+					mps_softmaxt = [graph transposeTensor:mps_softmaxt dimension:2 withDimension:3 name:nil];
+					mps_softmaxt = [graph reshapeTensor:mps_softmaxt withShape:@[@(batch_size), @(Hk), @(C), @(query_group_size * R)] name:nil];
+					MPSGraphTensor* mps_g_flat = [graph reshapeTensor:mps_g withShape:@[@(batch_size), @(Hk), @(query_group_size * R), @(D)] name:nil];
+					mps_dv = [graph matrixMultiplicationWithPrimaryTensor:mps_softmaxt secondaryTensor:mps_g_flat name:nil];
+
+					mps_dqk = [graph transposeTensor:mps_dqk dimension:3 withDimension:4 name:nil];
+					mps_dqk = [graph transposeTensor:mps_dqk dimension:2 withDimension:3 name:nil];
+					mps_dqk = [graph reshapeTensor:mps_dqk withShape:@[@(batch_size), @(Hk), @(C), @(query_group_size * R)] name:nil];
+					MPSGraphTensor* mps_q_flat = [graph reshapeTensor:mps_q withShape:@[@(batch_size), @(Hk), @(query_group_size * R), @(D)] name:nil];
+					mps_dk = [graph matrixMultiplicationWithPrimaryTensor:mps_dqk secondaryTensor:mps_q_flat name:nil];
+				}
+				mps_dq = [graph transposeTensor:mps_dq dimension:1 withDimension:2 name:nil];
+				[resultTensors addObject:mps_dq];
+				mps_dk = [graph transposeTensor:mps_dk dimension:1 withDimension:2 name:nil];
+				[resultTensors addObject:mps_dk];
+				mps_dv = [graph transposeTensor:mps_dv dimension:1 withDimension:2 name:nil];
+				[resultTensors addObject:mps_dv];
+			});
+			MPSGraphTensorData* data_g = ccv_nnc_mps_graph_tensor_data(g, gdim, gstride);
+			MPSGraphTensorData* data_q = ccv_nnc_mps_graph_tensor_data(q, qdim, qstride);
+			MPSGraphTensorData* data_k = ccv_nnc_mps_graph_tensor_data(k, kdim, kstride);
+			MPSGraphTensorData* data_v = ccv_nnc_mps_graph_tensor_data(v, vdim, vstride);
+			MPSGraphTensorData* data[] = {data_g, data_q, data_k, data_v};
+			ccv_nnc_mps_graph_executable_result(executable, command_buffer, @[data[indices[0]], data[indices[1]], data[indices[2]], data[indices[3]]], (ccv_nnc_tensor_view_t*[]){ dq, dk, dv }, (int*[]){ dqdim, dkdim, dvdim }, (int*[]){ dqstride, dkstride, dvstride }, 3, 0);
+			ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+		}
+	}
+	return CCV_NNC_EXEC_SUCCESS;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_SCALED_DOT_PRODUCT_ATTENTION_FORWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_NCHW;
+	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_QX | CCV_16BF | CCV_32S;
+	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_scaled_dot_product_attention_forw_mps;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_SCALED_DOT_PRODUCT_ATTENTION_BACKWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NHWC;
+	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_16BF;
+	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_scaled_dot_product_attention_back;
+}

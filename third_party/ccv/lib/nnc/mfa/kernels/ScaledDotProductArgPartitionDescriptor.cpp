@@ -1,0 +1,113 @@
+#include "ScaledDotProductArgPartitionDescriptor.hpp"
+#include "ScaledDotProductArgPartitionKernel.hpp"
+#include "ScaledDotProductArgPartitionKernelDescriptor.hpp"
+#include "../ccv_nnc_mfa_error.hpp"
+#include "../ccv_nnc_mfa_hash.hpp"
+#include <simd/simd.h>
+
+bool ScaledDotProductArgPartitionDescriptor::operator==(const ScaledDotProductArgPartitionDescriptor& rhs) const {
+  return
+  memoryPrecision == rhs.memoryPrecision &&
+  (loadM || T == rhs.T) &&
+  (loadC || C == rhs.C) &&
+  loadM == rhs.loadM &&
+  loadC == rhs.loadC &&
+  H == rhs.H &&
+  D == rhs.D &&
+  kth == rhs.kth &&
+  scoreMode == rhs.scoreMode &&
+  candidateBlockSize == rhs.candidateBlockSize &&
+  candidateCount == rhs.candidateCount &&
+  compressionRatio == rhs.compressionRatio &&
+  (loadC || queryOffset == rhs.queryOffset) &&
+  scale == rhs.scale &&
+  isCausal == rhs.isCausal &&
+  scoreBlockM == rhs.scoreBlockM &&
+  scoreBlockN == rhs.scoreBlockN &&
+  scoreSIMDGroups == rhs.scoreSIMDGroups;
+}
+
+std::size_t std::hash<ScaledDotProductArgPartitionDescriptor>::operator()(const ScaledDotProductArgPartitionDescriptor& hash) const noexcept {
+  using namespace ccv::nnc::mfa::hash;
+  std::size_t seed = 0;
+  seed = combine_32(seed, hash.scoreMode);
+  seed = combine_64(seed, pack_64(simd::uint2 { hash.candidateBlockSize, hash.candidateCount }));
+  seed = combine_32(seed, hash.loadM ? 1 : 0);
+  seed = combine_64(seed, pack_64(simd::uint2 { (unsigned int)hash.memoryPrecision.value, hash.loadM ? 0 : hash.T }));
+  seed = combine_64(seed, pack_64(simd::uint2 { hash.loadC ? 0 : hash.C, hash.H }));
+  seed = combine_64(seed, pack_64(simd::uint2 { hash.D, hash.kth }));
+  seed = combine_64(seed, pack_64(simd::uint2 { hash.compressionRatio, hash.isCausal ? 1u : 0u }));
+  seed = combine_32(seed, hash.loadC ? 0 : static_cast<uint32_t>(hash.queryOffset));
+  seed = combine_32(seed, pack_32(simd::ushort2 { hash.scoreBlockM, hash.scoreBlockN }));
+  seed = combine_32(seed, pack_32(simd::ushort2 { hash.scoreSIMDGroups, (unsigned short)(hash.loadC ? 1 : 0) }));
+  seed = combine_32(seed, uint32_t(std::hash<float>{}(hash.scale)));
+  return seed;
+}
+
+std::pair<ScaledDotProductArgPartitionKernelDescriptor, PipelineValue<ScaledDotProductArgPartitionKernel> *> ScaledDotProductArgPartitionDescriptor::findKernel(MTL::Device *const device, const DeviceProperties &dprops, NS::Array* const binaryArchivesToRead, MTL::BinaryArchive* const binaryArchiveToWrite, const std::string& pathToWrite, std::unordered_map<ScaledDotProductArgPartitionKernelDescriptor, std::unique_ptr<ScaledDotProductArgPartitionKernel>> *const libraryCache) const noexcept {
+  auto createKernel =
+  [=](ScaledDotProductArgPartitionKernelDescriptor descriptor) -> ScaledDotProductArgPartitionKernel* {
+    auto iterator = libraryCache->find(descriptor);
+    if (iterator != libraryCache->end()) {
+      return iterator->second.get();
+    } else {
+      ScaledDotProductArgPartitionKernel* kernel = new ScaledDotProductArgPartitionKernel(descriptor, device);
+      (*libraryCache)[descriptor] = std::unique_ptr<ScaledDotProductArgPartitionKernel>(kernel);
+      return kernel;
+    }
+  };
+
+  ScaledDotProductArgPartitionKernelDescriptor kernelDesc;
+  kernelDesc.memoryPrecision = memoryPrecision;
+  kernelDesc.kth = kth;
+  kernelDesc.scoreMode = scoreMode;
+  kernelDesc.scoreBlockM = scoreBlockM;
+  kernelDesc.scoreBlockN = scoreBlockN;
+  kernelDesc.scoreSIMDGroups = scoreSIMDGroups;
+  kernelDesc.loadC = loadC;
+  kernelDesc.loadM = loadM;
+
+  auto createPipeline =
+  [=](MTL::Library* library, const char* name) -> MTL::ComputePipelineState* {
+    auto constants = NS::TransferPtr(MTL::FunctionConstantValues::alloc()->init());
+    if (!loadM)
+      constants->setConstantValue(&T, MTL::DataTypeUInt, NS::UInteger(0));
+    if (!loadC) {
+      constants->setConstantValue(&C, MTL::DataTypeUInt, NS::UInteger(1));
+    }
+    constants->setConstantValue(&H, MTL::DataTypeUInt, NS::UInteger(2));
+    constants->setConstantValue(&D, MTL::DataTypeUInt, NS::UInteger(3));
+    if (scoreMode != 0) {
+      constants->setConstantValue(&candidateBlockSize, MTL::DataTypeUInt, NS::UInteger(8));
+      constants->setConstantValue(&candidateCount, MTL::DataTypeUInt, NS::UInteger(9));
+    }
+    constants->setConstantValue(&compressionRatio, MTL::DataTypeUInt, NS::UInteger(4));
+    constants->setConstantValue(&isCausal, MTL::DataTypeBool, NS::UInteger(5));
+    constants->setConstantValue(&scale, MTL::DataTypeFloat, NS::UInteger(6));
+    if (!loadC) {
+      constants->setConstantValue(&queryOffset, MTL::DataTypeInt, NS::UInteger(7));
+    }
+    NS::String* swiftName = NS::String::string(name, NS::UTF8StringEncoding);
+    NS::Error* error = nil;
+    auto function = NS::TransferPtr(library->newFunction(swiftName, constants.get(), &error));
+    CCV_NNC_MFA_CHECK_ERROR(error);
+    auto pipeline = device->newComputePipelineState(function.get(), &error);
+    CCV_NNC_MFA_CHECK_ERROR(error);
+    return pipeline;
+  };
+
+  ScaledDotProductArgPartitionKernel* kernel = createKernel(kernelDesc);
+  auto scorePipeline = NS::TransferPtr(createPipeline(kernel->library.get(), "index_score"));
+  auto topKSerialPipeline = NS::TransferPtr(createPipeline(kernel->library.get(), "topk_serial"));
+  auto topKTilePipeline = NS::TransferPtr(createPipeline(kernel->library.get(), "topk_tile"));
+  auto topKMergePipeline = NS::TransferPtr(createPipeline(kernel->library.get(), "topk_merge"));
+
+  PipelineValue<ScaledDotProductArgPartitionKernel>* output = new PipelineValue<ScaledDotProductArgPartitionKernel> { kernel, scorePipeline };
+  output->second = topKSerialPipeline;
+  output->third = topKTilePipeline;
+  output->fourth = topKMergePipeline;
+  if (scoreMode != 0) {
+    output->fifth = NS::TransferPtr(createPipeline(kernel->library.get(), "index_ids"));
+  }
+  return std::make_pair(kernelDesc, output);
+}

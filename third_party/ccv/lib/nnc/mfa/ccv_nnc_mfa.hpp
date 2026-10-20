@@ -1,0 +1,145 @@
+#ifndef GUARD_ccv_nnc_mfa_hpp
+#define GUARD_ccv_nnc_mfa_hpp
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include "ccv.h"
+#include "nnc/ccv_nnc.h"
+#ifdef __cplusplus
+}
+#endif
+#include "ccv_nnc_mfa_defines.hpp"
+#include "ccv_nnc_mfa_attention.hpp"
+#include "ccv_nnc_mfa_sol_attention.hpp"
+#include "ccv_nnc_mfa_normalization.hpp"
+#include "ccv_nnc_mfa_rmsnorm_gated.hpp"
+#include "ccv_nnc_mfa_rmsnorm_cmul.hpp"
+#include "ccv_nnc_mfa_depalettize.hpp"
+#include "ccv_nnc_mfa_dequantize_8i_rowwise.hpp"
+#include "ccv_nnc_mfa_dequantize_8i_rowwise_x.hpp"
+#include "ccv_nnc_mfa_dequantize_8i_rowwise_x_fp.hpp"
+#include "ccv_nnc_mfa_index_select.hpp"
+#include "ccv_nnc_mfa_index_select_8i_rowwise.hpp"
+#include "ccv_nnc_mfa_index_select_8i_rowwise_x.hpp"
+#include "ccv_nnc_mfa_adam.hpp"
+#include "ccv_nnc_mfa_cmul.hpp"
+#include "ccv_nnc_mfa_conform_data_format.hpp"
+#include "ccv_nnc_mfa_gelu.hpp"
+#include "ccv_nnc_mfa_gemm.hpp"
+#include "ccv_nnc_mfa_scaled_gemm.hpp"
+#include "ccv_nnc_mfa_scaled_gemv.hpp"
+#include "ccv_nnc_mfa_ane_rowwise_gemm.hpp"
+#include "ccv_nnc_mfa_segmented_scaled_gemm.hpp"
+#include "ccv_nnc_mfa_segmented_scaled_swiglu.hpp"
+#include "ccv_nnc_mfa_swiglu.hpp"
+#include "ccv_nnc_mfa_segmented_int8_gemv.hpp"
+#include "ccv_nnc_mfa_segmented_int8_swiglu.hpp"
+#include "ccv_nnc_mfa_conv3d.hpp"
+#include "ccv_nnc_mfa_gemv.hpp"
+#include "ccv_nnc_mfa_cast.hpp"
+#include "ccv_nnc_mfa_strided_copy.hpp"
+#include "ccv_nnc_mfa_transpose.hpp"
+#include "ccv_nnc_mfa_sigmoid.hpp"
+#include "ccv_nnc_mfa_tanh.hpp"
+#include "ccv_nnc_mfa_swish.hpp"
+#include "ccv_nnc_mfa_signed_sqrt.hpp"
+#include "ccv_nnc_mfa_swish_mul.hpp"
+#include "ccv_nnc_mfa_exp.hpp"
+#include "ccv_nnc_mfa_log.hpp"
+#include "ccv_nnc_mfa_clamp.hpp"
+#include "ccv_nnc_mfa_fill_if_less_than.hpp"
+#include "ccv_nnc_mfa_reduce_max.hpp"
+#include "ccv_nnc_mfa_reduce_logsumexp.hpp"
+#include "ccv_nnc_mfa_softplus.hpp"
+#include "ccv_nnc_mfa_add.hpp"
+#include "ccv_nnc_mfa_mul.hpp"
+#include "ccv_nnc_mfa_fast_fence.hpp"
+#include "ccv_nnc_mfa_rotate_half.hpp"
+#include "ccv_nnc_mfa_scaled_dot_product_arg_partition.hpp"
+#include "ccv_nnc_mfa_sparse_indexed_attention.hpp"
+#include "ccv_nnc_mfa_walsh_hadamard_transform.hpp"
+#include "ccv_nnc_mfa_hyper_connection.hpp"
+#include "ccv_nnc_mfa_segmented_gemm.hpp"
+#include "ccv_nnc_mfa_gated_delta.hpp"
+#include "ccv_nnc_mfa_moe_routing.hpp"
+#include "ccv_nnc_mfa_moe_weights_streaming.hpp"
+#include "ccv_nnc_mfa_scatter_add.hpp"
+#include "ccv_nnc_mfa_argmax.hpp"
+
+#ifdef __cplusplus
+#include <memory>
+#include "nnc/mfa/3rdparty/metal-cpp/Dispatch.hpp"
+#include "nnc/mfa/3rdparty/metal-cpp/Metal.hpp"
+#include "ccv_nnc_mfa_error.hpp"
+#include "kernels/ShaderCache.hpp"
+
+namespace ccv {
+namespace nnc {
+namespace mfa {
+
+class context;
+struct durable_scratch_pool;
+
+class context {
+public:
+  bool supported;
+  uint16_t log_level;
+  DeviceProperties device_properties;
+  
+  NS::SharedPtr<MTL::Device> device;
+  NS::SharedPtr<MTL::Buffer> scratch;
+  std::shared_ptr<durable_scratch_pool> durable_scratch;
+  void* ane_rowwise_gemm_cache;
+  
+  context(MTL::Device* device);
+  
+  ShaderCache kernel_cache;
+  
+  MTL::Buffer* request_scratch(uint64_t size);
+  void clear_durable_scratch_cache();
+};
+
+} // namespace mfa
+} // namespace nnc
+} // namespace ccv
+
+extern "C" {
+#endif // __cplusplus
+
+typedef struct ccv_nnc_mfa_durable_scratch_s ccv_nnc_mfa_durable_scratch_t;
+
+ccv_nnc_mfa_context_t* ccv_nnc_init_mfa_context(mtl_device_t* context);
+void ccv_nnc_mfa_clear_pipeline_cache(ccv_nnc_mfa_context_t* context);
+void ccv_nnc_deinit_mfa_context(ccv_nnc_mfa_context_t* context);
+uint8_t ccv_nnc_mfa_context_supported(ccv_nnc_mfa_context_t* context);
+uint8_t ccv_nnc_mfa_supports_int8_ane(ccv_nnc_mfa_context_t* context);
+uint8_t ccv_nnc_mfa_supports_int8_matmul(ccv_nnc_mfa_context_t* context, uint32_t m, uint32_t n);
+uint8_t ccv_nnc_mfa_has_neural_accelerators(ccv_nnc_mfa_context_t* context);
+uint8_t ccv_nnc_mfa_neural_accelerators_support_bfloat(ccv_nnc_mfa_context_t* context);
+uint16_t ccv_nnc_mfa_context_log_level(ccv_nnc_mfa_context_t* context);
+void ccv_nnc_mfa_log_message(const char* message);
+
+mtl_command_batch_t* ccv_nnc_start_command_batch(mtl_command_queue_t* command_queue);
+mtl_command_batch_t* ccv_nnc_start_command_batch_from_command_buffer(mtl_command_buffer_t* command_buffer, int commit_on_finish);
+void ccv_nnc_finish_command_batch(mtl_command_batch_t* command_batch);
+mtl_buffer_t* ccv_nnc_mfa_request_scratch(ccv_nnc_mfa_context_t* context, const uint64_t size);
+/** Returns an exclusive, CPU-visible scratch lease, or 0 when allocation fails. */
+CCV_WARN_UNUSED(ccv_nnc_mfa_durable_scratch_t*) ccv_nnc_mfa_request_durable_scratch(ccv_nnc_mfa_context_t* context, uint64_t size);
+/** Returns the borrowed buffer owned by lease. */
+mtl_buffer_t* ccv_nnc_mfa_durable_scratch_buffer(const ccv_nnc_mfa_durable_scratch_t* lease);
+/** Returns an unsubmitted lease immediately. */
+void ccv_nnc_mfa_release_durable_scratch(ccv_nnc_mfa_durable_scratch_t* lease);
+/**
+ * Consumes a submitted lease and delays pool reuse until command_batch completes.
+ * This prevents another CPU writer from refilling the CPU-visible buffer while
+ * the GPU still reads it; Metal hazard tracking does not cover CPU accesses.
+ */
+int ccv_nnc_mfa_retire_durable_scratch(ccv_nnc_mfa_durable_scratch_t* lease, mtl_command_batch_t* command_batch);
+void ccv_nnc_mfa_set_binary_archives(ccv_nnc_mfa_context_t* context, const char** paths_to_read, const int paths_to_read_size, const char* path_to_write);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif // __cplusplus
+
+#endif

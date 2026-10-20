@@ -1,0 +1,52 @@
+#include "NAMatMulKernelDescriptor.hpp"
+#include "../ccv_nnc_mfa_error.hpp"
+#include "../ccv_nnc_mfa_hash.hpp"
+
+// MARK: - Hash Conformance
+
+bool NAMatMulKernelDescriptor::operator==(const NAMatMulKernelDescriptor& rhs) const {
+  return
+  simd_all(blockDimensions == rhs.blockDimensions) &&
+  memoryPrecisions == rhs.memoryPrecisions &&
+  registerPrecisions == rhs.registerPrecisions &&
+  (splitK == rhs.splitK) &&
+  (executionSIMDGroups == rhs.executionSIMDGroups) &&
+  (threadBarrierOverK == rhs.threadBarrierOverK) &&
+  simd_all(transposeState == rhs.transposeState) &&
+  (useBias == rhs.useBias) &&
+  (loadM == rhs.loadM) &&
+  (useLeadingDimensions == rhs.useLeadingDimensions) &&
+  (groupM == rhs.groupM) &&
+  (groupN == rhs.groupN);
+}
+
+std::size_t std::hash<NAMatMulKernelDescriptor>::operator()(const NAMatMulKernelDescriptor& hash) const noexcept {
+  std::size_t seed = 0;
+  using namespace ccv::nnc::mfa::hash;
+  seed = combine_64(seed, pack_64(simd_make_ushort4(hash.blockDimensions, 0)));
+  seed = combine_64(seed, pack_64(simd::ushort4 { hash.memoryPrecisions.A.value, hash.memoryPrecisions.B.value, hash.memoryPrecisions.C.value, hash.memoryPrecisions.bias.value }));
+  seed = combine_64(seed, pack_64(simd::ushort4 { hash.registerPrecisions.A.value, hash.registerPrecisions.B.value, hash.registerPrecisions.C.value, hash.registerPrecisions.bias.value }));
+  seed = combine_64(seed, pack_64(simd::ushort4 { hash.splitK, hash.executionSIMDGroups, uint16_t(hash.threadBarrierOverK), 0 }));
+  seed = combine_32(seed, pack_32(simd::uchar4 { hash.transposeState[0], hash.transposeState[1], hash.transposeState[2], hash.useBias }));
+  seed = combine_32(seed, pack_32(simd::uchar4 { hash.loadM, hash.useLeadingDimensions, 0, 0 }));
+  seed = combine_32(seed, hash.groupM);
+  seed = combine_32(seed, hash.groupN);
+  return seed;
+}
+
+// MARK: - Initializer
+
+NAMatMulKernelDescriptor::NAMatMulKernelDescriptor(simd::ushort3 blockDimensions, GEMMOperandPrecisions memoryPrecisions, GEMMOperandPrecisions registerPrecisions, uint16_t splitK, uint16_t executionSIMDGroups, bool threadBarrierOverK, simd::uchar3 transposeState, bool useBias, bool loadM, uint32_t groupM, uint32_t groupN, bool useLeadingDimensions) noexcept {
+  this->blockDimensions = blockDimensions;
+  this->memoryPrecisions = memoryPrecisions;
+  this->registerPrecisions = registerPrecisions;
+  this->splitK = splitK;
+  this->executionSIMDGroups = executionSIMDGroups;
+  this->threadBarrierOverK = threadBarrierOverK;
+  this->transposeState = transposeState;
+  this->useBias = useBias;
+  this->loadM = loadM;
+  this->useLeadingDimensions = useLeadingDimensions;
+  this->groupM = groupM;
+  this->groupN = groupN;
+}

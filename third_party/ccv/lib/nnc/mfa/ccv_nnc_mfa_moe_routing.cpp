@@ -1,0 +1,63 @@
+#include "ccv_nnc_mfa.hpp"
+#include "kernels/MoERoutingDescriptor.hpp"
+#include "kernels/MoERoutingKernel.hpp"
+using namespace ccv::nnc;
+
+void ccv_nnc_mfa_prepare_moe_routing(ccv_nnc_mfa_context_t* context, ccv_nnc_mfa_moe_routing_params_t params)
+{
+	const MoERoutingDescriptor descriptor {
+		params.activation_data_type,
+		params.routing_data_type,
+		params.expert_count,
+		params.kth,
+		params.hidden,
+		params.weight_scale,
+		params.preselected != 0,
+		params.single_input_token != 0,
+		params.normalization_epsilon,
+		params.sigmoid != 0,
+	};
+	auto pool = NS::AutoreleasePool::alloc()->init();
+	context->kernel_cache.findKernel<MoERoutingKernel, MoERoutingDescriptor, MoERoutingKernelDescriptor>(descriptor, context->device.get(), DeviceProperties());
+	pool->drain();
+}
+
+void ccv_nnc_mfa_encode_moe_routing(ccv_nnc_mfa_context_t* context, ccv_nnc_mfa_moe_routing_params_t params, mtl_command_batch_t* command_batch, mtl_buffer_t** tensors, size_t* tensor_offsets)
+{
+	CCV_NNC_MFA_PRECONDITION(params.expert_count > 0 && params.expert_count <= 512);
+	CCV_NNC_MFA_PRECONDITION(params.kth > 0 && params.kth <= 32 && params.kth <= params.expert_count);
+	CCV_NNC_MFA_PRECONDITION(params.hidden > 0);
+	auto encoder = command_batch->startCommand();
+	int num_tensors = 0;
+	while (tensors[num_tensors] != nullptr)
+	{
+		encoder->setBuffer(tensors[num_tensors], tensor_offsets[num_tensors], NS::UInteger(num_tensors));
+		++num_tensors;
+	}
+	CCV_NNC_MFA_PRECONDITION(num_tensors == 8);
+	const MoERoutingDescriptor descriptor {
+		params.activation_data_type,
+		params.routing_data_type,
+		params.expert_count,
+		params.kth,
+		params.hidden,
+		params.weight_scale,
+		params.preselected != 0,
+		params.single_input_token != 0,
+		params.normalization_epsilon,
+		params.sigmoid != 0,
+	};
+	auto pool = NS::AutoreleasePool::alloc()->init();
+	auto pipeline_value = context->kernel_cache.findKernel<MoERoutingKernel, MoERoutingDescriptor, MoERoutingKernelDescriptor>(descriptor, context->device.get(), DeviceProperties());
+	pool->drain();
+	encoder->setComputePipelineState(pipeline_value->pipeline.get());
+	encoder->setThreadgroupMemoryLength((NS::UInteger(params.expert_count * sizeof(float)) + 15) & ~NS::UInteger(15), 0);
+	encoder->useResource(tensors[0], MTL::ResourceUsageRead);
+	encoder->useResource(tensors[1], MTL::ResourceUsageRead);
+	encoder->useResource(tensors[2], MTL::ResourceUsageRead);
+	int i;
+	for (i = 3; i < 8; i++)
+		encoder->useResource(tensors[i], MTL::ResourceUsageWrite);
+	encoder->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(descriptor.executionSIMDGroups() * 32, 1, 1));
+	command_batch->finishCommand(encoder);
+}

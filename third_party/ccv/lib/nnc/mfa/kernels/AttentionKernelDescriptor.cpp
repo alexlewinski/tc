@@ -1,0 +1,63 @@
+#include "AttentionKernelDescriptor.hpp"
+#include "../ccv_nnc_mfa_error.hpp"
+#include "../ccv_nnc_mfa_hash.hpp"
+
+// MARK: - Hash Conformance
+
+bool AttentionKernelDescriptor::operator==(const AttentionKernelDescriptor& rhs) const {
+  return
+  loadR == rhs.loadR && loadC == rhs.loadC &&
+  simd_all(blockDimensions == rhs.blockDimensions) &&
+  cacheState == rhs.cacheState &&
+  headDimension == rhs.headDimension &&
+  memoryPrecisions == rhs.memoryPrecisions &&
+  (preferAsyncCache == rhs.preferAsyncCache) &&
+  (preferAsyncLoad == rhs.preferAsyncLoad) &&
+  registerPrecisions == rhs.registerPrecisions &&
+  transposeState == rhs.transposeState &&
+  leadingDimensions == rhs.leadingDimensions &&
+  isCausal == rhs.isCausal &&
+  masked == rhs.masked &&
+  isVarlen == rhs.isVarlen &&
+  slidingWindow == rhs.slidingWindow &&
+  type == rhs.type;
+}
+
+std::size_t std::hash<AttentionKernelDescriptor>::operator()(const AttentionKernelDescriptor& hash) const noexcept {
+  std::size_t seed = 0;
+  using namespace ccv::nnc::mfa::hash;
+  seed = combine_32(seed, (hash.loadR ? 1 : 0) | (hash.loadC ? 2 : 0));
+  seed = combine_64(seed, pack_64(simd_make_ushort4(hash.blockDimensions, 0)));
+  seed = combine_32(seed, pack_32(simd::ushort2 { hash.headDimension, hash.type.value }));
+  seed = combine_32(seed, pack_32(simd::uchar4 { hash.preferAsyncCache, hash.preferAsyncLoad, hash.isCausal, hash.masked }));
+  if (hash.isVarlen) {
+    seed = combine_32(seed, pack_32(simd::ushort2 { 1, 0 }));
+  }
+  seed = combine_32(seed, hash.slidingWindow);
+  return seed;
+}
+
+// MARK: - Initializer
+
+AttentionKernelDescriptor::AttentionKernelDescriptor(simd::ushort3 blockDimensions, AttentionOperands<bool> cacheState, unsigned short headDimension, AttentionOperands<GEMMOperandPrecision> memoryPrecisions, bool preferAsyncCache, bool preferAsyncLoad, AttentionOperands<GEMMOperandPrecision> registerPrecisions, AttentionOperands<bool> transposeState, AttentionOperands<bool> leadingDimensions, AttentionKernelType type) noexcept
+  : AttentionKernelDescriptor(blockDimensions, cacheState, headDimension, memoryPrecisions, preferAsyncCache, preferAsyncLoad, registerPrecisions, transposeState, leadingDimensions, type, false, false) {}
+
+AttentionKernelDescriptor::AttentionKernelDescriptor(simd::ushort3 blockDimensions, AttentionOperands<bool> cacheState, unsigned short headDimension, AttentionOperands<GEMMOperandPrecision> memoryPrecisions, bool preferAsyncCache, bool preferAsyncLoad, AttentionOperands<GEMMOperandPrecision> registerPrecisions, AttentionOperands<bool> transposeState, AttentionOperands<bool> leadingDimensions, AttentionKernelType type, bool isCausal, bool masked) noexcept
+  : AttentionKernelDescriptor(blockDimensions, cacheState, headDimension, memoryPrecisions, preferAsyncCache, preferAsyncLoad, registerPrecisions, transposeState, leadingDimensions, type, isCausal, masked, false) {}
+
+AttentionKernelDescriptor::AttentionKernelDescriptor(simd::ushort3 blockDimensions, AttentionOperands<bool> cacheState, unsigned short headDimension, AttentionOperands<GEMMOperandPrecision> memoryPrecisions, bool preferAsyncCache, bool preferAsyncLoad, AttentionOperands<GEMMOperandPrecision> registerPrecisions, AttentionOperands<bool> transposeState, AttentionOperands<bool> leadingDimensions, AttentionKernelType type, bool isCausal, bool masked, bool isVarlen, uint32_t slidingWindow) noexcept {
+  this->blockDimensions = blockDimensions;
+  this->cacheState = cacheState;
+  this->headDimension = headDimension;
+  this->memoryPrecisions = memoryPrecisions;
+  this->preferAsyncCache = preferAsyncCache;
+  this->preferAsyncLoad = preferAsyncLoad;
+  this->registerPrecisions = registerPrecisions;
+  this->transposeState = transposeState;
+  this->leadingDimensions = leadingDimensions;
+  this->type = type;
+  this->isCausal = isCausal;
+  this->masked = masked;
+  this->isVarlen = isVarlen;
+  this->slidingWindow = slidingWindow;
+}

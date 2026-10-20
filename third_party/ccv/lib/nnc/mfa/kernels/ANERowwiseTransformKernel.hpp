@@ -1,0 +1,33 @@
+#ifndef ANERowwiseTransformKernel_hpp
+#define ANERowwiseTransformKernel_hpp
+
+#include "ANERowwiseTransformKernelDescriptor.hpp"
+#include "nnc/mfa/3rdparty/metal-cpp/Metal.hpp"
+#include <simd/simd.h>
+
+struct ANERowwiseTransformKernel {
+  NS::SharedPtr<MTL::Library> library;
+  std::string source;
+
+  GEMMOperandPrecision memoryPrecision;
+  bool activationHadamard256 = false;
+  uint16_t activationPrepareThreads;
+  uint16_t quantTileDimension;
+  uint16_t quantBlockRows;
+  uint16_t quantTilePad;
+  simd::ushort2 outputTileDimensions;
+
+  ANERowwiseTransformKernel(ANERowwiseTransformKernelDescriptor descriptor, MTL::Device* const device);
+
+  MTL::Size activationPrepareThreadgroupSize(uint32_t K) const noexcept;
+  MTL::Size activationQuantizeThreadgroupSize() const noexcept;
+  MTL::Size outputDequantizeThreadgroupSize() const noexcept;
+  MTL::Size activationPrepareGridSize(uint32_t paddedM, uint32_t K) const noexcept;
+  MTL::Size activationQuantizeGridSize(uint32_t paddedM, uint32_t K) const noexcept;
+  MTL::Size outputDequantizeGridSize(uint32_t paddedM, uint32_t N) const noexcept;
+
+private:
+  std::string createSource() const noexcept;
+};
+
+#endif

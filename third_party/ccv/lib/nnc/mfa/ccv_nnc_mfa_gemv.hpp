@@ -1,0 +1,27 @@
+#ifndef GUARD_ccv_nnc_mfa_gemv_hpp
+#define GUARD_ccv_nnc_mfa_gemv_hpp
+
+typedef struct {
+  uint64_t data_type;
+  uint32_t mrows;
+  uint32_t nrows;
+  uint32_t ncols;
+  uint32_t batch_dimension;
+  uint32_t batch_stride_a;
+  uint32_t batch_stride_b;
+  uint32_t batch_stride_c;
+  uint8_t fused_bias;
+} ccv_nnc_mfa_gemv_params_t;
+
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
+void ccv_nnc_mfa_prepare_gemv(ccv_nnc_mfa_context_t* context, ccv_nnc_mfa_gemv_params_t params);
+void ccv_nnc_mfa_encode_gemv(ccv_nnc_mfa_context_t* context, ccv_nnc_mfa_gemv_params_t params, mtl_command_batch_t* command_batch, mtl_buffer_t** tensors, size_t* tensor_offsets);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif // __cplusplus
+
+#endif

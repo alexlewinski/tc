@@ -1,0 +1,479 @@
+#include "ccv_nnc_mfa.hpp"
+using namespace ccv::nnc;
+
+#include "kernels/ShaderCache.hpp"
+#include "kernels/NAInt8MatMulKernel.hpp"
+#include "kernels/NAInt8MatMulKernelDescriptor.hpp"
+#include "kernels/NAInt8MatMulDescriptor.hpp"
+#include "kernels/NAInt8MatMulSmallMKernel.hpp"
+#include "kernels/NAInt8MatMulSmallMKernelDescriptor.hpp"
+#include "kernels/NAInt8MatMulSmallMDescriptor.hpp"
+#include "kernels/Int8MatMulDescriptor.hpp"
+#include "kernels/Int8MatMulKernelDescriptor.hpp"
+#include "kernels/Int8MatMulKernel.hpp"
+
+namespace {
+
+static constexpr uint32_t kNAInt8MatMulSmallMLowKMaxM = 16;
+static constexpr uint32_t kNAInt8MatMulSmallMReducedMaxM = 16;
+static constexpr uint32_t kNAInt8MatMulSmallMHighK = 16384;
+static constexpr uint32_t kNAInt8MatMulSmallMPack = 8;
+
+static size_t align_up(const size_t value, const size_t alignment) noexcept {
+  return (value + alignment - 1) & ~(alignment - 1);
+}
+
+typedef struct {
+  size_t q_bytes;
+  size_t scale_offset;
+  size_t scale_bytes;
+  size_t scratch_bytes;
+} ccv_nnc_mfa_activation_quant_layout_t;
+
+typedef struct {
+  size_t activation_offset;
+  size_t scale_offset;
+  size_t weight_offset;
+  size_t scratch_bytes;
+} ccv_nnc_mfa_int8_matmul_layout_t;
+
+static GEMMOperandPrecision io_precision(uint64_t data_type) noexcept {
+  switch (data_type) {
+    case MTL::DataTypeHalf:
+      return GEMMOperandPrecision::FP16;
+    case MTL::DataTypeBFloat:
+      return GEMMOperandPrecision::BF16;
+    case MTL::DataTypeFloat:
+      return GEMMOperandPrecision::FP32;
+    default:
+      CCV_NNC_MFA_PRECONDITION(false);
+      return GEMMOperandPrecision::FP16;
+  }
+}
+
+static ccv_nnc_mfa_activation_quant_layout_t activation_quant_layout(ccv_nnc_mfa_scaled_gemm_params_t params) noexcept
+{
+  const size_t q_bytes = (size_t)params.batch_dimension * params.M * params.K * sizeof(int8_t);
+  const size_t scale_offset = align_up(q_bytes, 256);
+  const size_t scale_bytes = (size_t)params.batch_dimension * params.M * io_precision(params.data_type).size();
+  return (ccv_nnc_mfa_activation_quant_layout_t){
+    .q_bytes = q_bytes,
+    .scale_offset = scale_offset,
+    .scale_bytes = scale_bytes,
+    .scratch_bytes = align_up(scale_offset + scale_bytes, 256),
+  };
+}
+
+static size_t rowwise_8i_scale_offset(const size_t rows, const size_t cols) noexcept
+{
+  return align_up(rows * cols * sizeof(int8_t), 128);
+}
+
+static ccv_nnc_mfa_gemm_params_t int8_matmul_gemm_params(ccv_nnc_mfa_scaled_gemm_params_t params) noexcept
+{
+  return (ccv_nnc_mfa_gemm_params_t){
+    .data_type = MTL::DataTypeHalf,
+    .M = params.M,
+    .N = params.N,
+    .K = params.K,
+    .A_trans = 0,
+    .B_trans = 1,
+    .D_trans = 0,
+    .fused_bias = 0,
+    .register_float = 1,
+    .use_neural_accelerators = 0,
+    .batch_dimension = 1,
+    .loadM = params.loadM,
+    .output_data_type = MTL::DataTypeFloat,
+  };
+}
+
+// The dense Int8MatMul reads the int8 weights directly and scales its output
+// while storing it, instead of casting the weights to FP16 for GEMM and scaling
+// the FP32 output afterwards. Like GEMM, it loads directly from device memory
+// on Apple9 or newer; other GPUs keep GEMM, which uses async copies.
+static bool int8_matmul_use_dense(mfa::context* context, ccv_nnc_mfa_scaled_gemm_params_t params) noexcept
+{
+  return context->device->supportsFamily(MTL::GPUFamily(1009)) && (params.K % 8) == 0;
+}
+
+// FP16 activations need no quantization: the dense kernel reads them as they
+// are, or rotated into scratch for H256 weights. Any other precision (FP32, or
+// BF16 if supported) is quantized to FP16 codes with row-wise scales, so the
+// multiplication stays in FP16.
+static bool int8_matmul_direct_activations(ccv_nnc_mfa_scaled_gemm_params_t params) noexcept
+{
+  return params.data_type == MTL::DataTypeHalf && !params.activation_hadamard_256;
+}
+
+// Dense: [activation codes][activation scales], FP16 [rotated activations] or nothing.
+// Otherwise: [GEMM scratch][activation codes][activation scales][weight codes].
+static ccv_nnc_mfa_int8_matmul_layout_t int8_matmul_layout(ccv_nnc_mfa_scaled_gemm_params_t params, const bool dense) noexcept
+{
+  const size_t activation_offset = dense ? 0 : align_up(ccv_nnc_mfa_gemm_reserved_scratch_size(int8_matmul_gemm_params(params)), 128);
+  const size_t activation_bytes = int8_matmul_direct_activations(params) ? 0 : (size_t)params.M * params.K * sizeof(uint16_t);
+  const size_t scale_offset = align_up(activation_offset + activation_bytes, 128);
+  const size_t scale_bytes = params.data_type == MTL::DataTypeHalf ? 0 : (size_t)params.M * sizeof(float);
+  const size_t weight_offset = align_up(scale_offset + scale_bytes, 128);
+  const size_t weight_bytes = dense ? 0 : (size_t)params.N * params.K * sizeof(uint16_t);
+  return (ccv_nnc_mfa_int8_matmul_layout_t){
+    .activation_offset = activation_offset,
+    .scale_offset = scale_offset,
+    .weight_offset = weight_offset,
+    .scratch_bytes = weight_offset + weight_bytes,
+  };
+}
+
+static NAInt8MatMulSmallMDescriptor make_na_int8_matmul_small_m_descriptor(ccv_nnc_mfa_scaled_gemm_params_t params) noexcept
+{
+  NAInt8MatMulSmallMDescriptor desc;
+  desc.batchDimension = params.batch_dimension;
+  desc.ioPrecision = io_precision(params.data_type);
+  desc.matrixDimensions = simd::uint3 { params.M, params.N, params.K };
+  desc.useBias = params.fused_bias;
+  desc.loadM = params.loadM;
+  return desc;
+}
+
+static bool use_na_int8_matmul_small_m(ccv_nnc_mfa_scaled_gemm_params_t params) noexcept
+{
+  NAInt8MatMulSmallMDescriptor splitDesc = make_na_int8_matmul_small_m_descriptor(params);
+  const uint16_t splitK = splitDesc.splitK();
+  const uint32_t high_k_max_m = splitK > 1 ? kNAInt8MatMulSmallMReducedMaxM : 8;
+  const uint32_t max_m = params.K >= kNAInt8MatMulSmallMHighK ? high_k_max_m : kNAInt8MatMulSmallMLowKMaxM;
+  return params.use_neural_accelerators &&
+    !params.leading_dimension_a &&
+    !params.leading_dimension_c &&
+    params.M <= max_m &&
+    params.batch_dimension == 1 &&
+    (params.K % kNAInt8MatMulSmallMPack) == 0 &&
+    params.K < 65536;
+}
+
+}
+
+void ccv_nnc_mfa_prepare_scaled_gemm(mfa::context* context, ccv_nnc_mfa_scaled_gemm_params_t params)
+{
+  (void)context;
+  (void)params;
+}
+
+size_t ccv_nnc_mfa_scaled_gemm_reserved_scratch_size(mfa::context* context, ccv_nnc_mfa_scaled_gemm_params_t params)
+{
+  if (!params.use_neural_accelerators) {
+    const bool dense = int8_matmul_use_dense(context, params);
+    CCV_NNC_MFA_PRECONDITION(params.data_type == MTL::DataTypeFloat || (params.data_type == MTL::DataTypeHalf && dense));
+    CCV_NNC_MFA_PRECONDITION((!params.fused_bias || dense) && params.batch_dimension == 1);
+    CCV_NNC_MFA_PRECONDITION(!params.leading_dimension_a && !params.leading_dimension_c);
+    return int8_matmul_layout(params, dense).scratch_bytes;
+  }
+  const ccv_nnc_mfa_activation_quant_layout_t a_layout = activation_quant_layout(params);
+  if (use_na_int8_matmul_small_m(params)) {
+    const NAInt8MatMulSmallMDescriptor desc = make_na_int8_matmul_small_m_descriptor(params);
+    return align_up(align_up(a_layout.scratch_bytes, 256) + desc.scratchOffsets().total, 256);
+  }
+  return a_layout.scratch_bytes;
+}
+
+void ccv_nnc_mfa_encode_scaled_gemm(mfa::context* context, ccv_nnc_mfa_scaled_gemm_params_t params, MTL::CommandBatch* command_batch, MTL::Buffer** tensors, size_t* tensor_offsets)
+{
+  int num_tensors = 0;
+  while (tensors[num_tensors] != nullptr)
+    ++num_tensors;
+  CCV_NNC_MFA_PRECONDITION((num_tensors == 3) || (num_tensors == 4));
+  if (!params.use_neural_accelerators) {
+    const bool dense = int8_matmul_use_dense(context, params);
+    CCV_NNC_MFA_PRECONDITION(params.data_type == MTL::DataTypeFloat || (params.data_type == MTL::DataTypeHalf && dense));
+    CCV_NNC_MFA_PRECONDITION((!params.fused_bias || dense) && params.batch_dimension == 1);
+    CCV_NNC_MFA_PRECONDITION(num_tensors == (params.fused_bias ? 4 : 3));
+    CCV_NNC_MFA_PRECONDITION(!params.leading_dimension_a && !params.leading_dimension_c);
+    CCV_NNC_MFA_PRECONDITION((uint64_t)params.M * params.K <= UINT32_MAX);
+    CCV_NNC_MFA_PRECONDITION((uint64_t)params.N * params.K <= UINT32_MAX);
+    CCV_NNC_MFA_PRECONDITION((uint64_t)params.M * params.N <= UINT32_MAX);
+    const bool fp16 = params.data_type == MTL::DataTypeHalf;
+    const bool direct_activations = int8_matmul_direct_activations(params);
+    const Int8MatMulDescriptor descriptor = {
+      .M = params.M,
+      .N = params.N,
+      .K = params.K,
+      .expertCount = 1,
+      .binCount = 0,
+      .operation = fp16 ? Int8MatMulRotateActivation : Int8MatMulQuantizeActivation,
+      .ioPrecision = io_precision(params.data_type),
+      .activationHadamard256 = !fp16 && params.activation_hadamard_256,
+    };
+    auto int8_matmul_pipeline = [&](const Int8MatMulDescriptor& operation_descriptor, const Int8MatMulKernelDescriptor& kernel_descriptor) {
+      auto pool = NS::AutoreleasePool::alloc()->init();
+      auto pipeline = context->kernel_cache.findKernel<Int8MatMulKernel>(operation_descriptor, kernel_descriptor, context->device.get());
+      pool->drain();
+      return pipeline;
+    };
+    auto descriptor_for = [&](const Int8MatMulOperation operation) {
+      Int8MatMulDescriptor operation_descriptor = descriptor;
+      operation_descriptor.operation = operation;
+      operation_descriptor.activationHadamard256 = false;
+      return operation_descriptor;
+    };
+    const ccv_nnc_mfa_int8_matmul_layout_t layout = int8_matmul_layout(params, dense);
+    auto scratch = layout.scratch_bytes ? context->request_scratch(layout.scratch_bytes) : nullptr;
+    const size_t weight_scale_offset = rowwise_8i_scale_offset(params.N, params.K);
+    if (!direct_activations) {
+      auto prepare_pipeline = int8_matmul_pipeline(descriptor, Int8MatMulKernelDescriptor(descriptor, context->device_properties));
+      auto encoder = command_batch->startCommand();
+      encoder->setComputePipelineState(prepare_pipeline->pipeline.get());
+      encoder->useResource(tensors[0], MTL::ResourceUsageRead);
+      encoder->useResource(scratch, MTL::ResourceUsageWrite);
+      encoder->setBuffer(tensors[0], tensor_offsets[0], 0);
+      encoder->setBuffer(scratch, layout.activation_offset, 1);
+      if (!fp16)
+        encoder->setBuffer(scratch, layout.scale_offset, 2);
+      encoder->dispatchThreadgroups(prepare_pipeline->kernel->threadgroupsPerGrid(descriptor), prepare_pipeline->kernel->threadgroupSize);
+      command_batch->finishCommand(encoder);
+    }
+    if (dense) {
+      Int8MatMulDescriptor dense_descriptor = descriptor_for(Int8MatMulDense);
+      dense_descriptor.useBias = params.fused_bias;
+      Int8MatMulKernelDescriptor kernel_descriptor(dense_descriptor, context->device_properties);
+      // Interleaved loads read 4-byte aligned weight rows (K is a multiple of
+      // 8), and 8-byte aligned activation rows; single loads read 4 bytes, as
+      // GEMM's do.
+      if (tensor_offsets[1] % 4 != 0 || (direct_activations && tensor_offsets[0] % 8 != 0))
+        kernel_descriptor.kInterleave = 1;
+      auto dense_pipeline = int8_matmul_pipeline(dense_descriptor, kernel_descriptor);
+      MTL::Buffer* const activations = direct_activations ? tensors[0] : scratch;
+      auto encoder = command_batch->startCommand();
+      encoder->setComputePipelineState(dense_pipeline->pipeline.get());
+      encoder->useResource(activations, MTL::ResourceUsageRead);
+      encoder->useResource(tensors[1], MTL::ResourceUsageRead);
+      encoder->useResource(tensors[2], MTL::ResourceUsageWrite);
+      if (params.fused_bias)
+        encoder->useResource(tensors[3], MTL::ResourceUsageRead);
+      encoder->setBuffer(activations, direct_activations ? tensor_offsets[0] : layout.activation_offset, 0);
+      encoder->setBuffer(tensors[1], tensor_offsets[1], 1);
+      encoder->setBuffer(tensors[2], tensor_offsets[2], 2);
+      if (!fp16)
+        encoder->setBuffer(scratch, layout.scale_offset, 3);
+      encoder->setBuffer(tensors[1], tensor_offsets[1] + weight_scale_offset, 4);
+      if (params.fused_bias)
+        encoder->setBuffer(tensors[3], tensor_offsets[3], 5);
+      encoder->dispatchThreadgroups(dense_pipeline->kernel->threadgroupsPerGrid(dense_descriptor), dense_pipeline->kernel->threadgroupSize);
+      command_batch->finishCommand(encoder);
+      return;
+    }
+    const Int8MatMulDescriptor cast_descriptor = descriptor_for(Int8MatMulCastWeights);
+    auto cast_pipeline = int8_matmul_pipeline(cast_descriptor, Int8MatMulKernelDescriptor(cast_descriptor, context->device_properties));
+    const Int8MatMulDescriptor dequantize_descriptor = descriptor_for(Int8MatMulDequantizeOutput);
+    auto dequantize_pipeline = int8_matmul_pipeline(dequantize_descriptor, Int8MatMulKernelDescriptor(dequantize_descriptor, context->device_properties));
+    {
+      auto encoder = command_batch->startCommand();
+      encoder->setComputePipelineState(cast_pipeline->pipeline.get());
+      encoder->useResource(tensors[1], MTL::ResourceUsageRead);
+      encoder->useResource(scratch, MTL::ResourceUsageWrite);
+      encoder->setBuffer(tensors[1], tensor_offsets[1], 0);
+      encoder->setBuffer(scratch, layout.weight_offset, 1);
+      encoder->dispatchThreadgroups(cast_pipeline->kernel->threadgroupsPerGrid(cast_descriptor), cast_pipeline->kernel->threadgroupSize);
+      command_batch->finishCommand(encoder);
+    }
+    const ccv_nnc_mfa_gemm_params_t gemm_params = int8_matmul_gemm_params(params);
+    MTL::Buffer* gemm_tensors[4] = { scratch, scratch, tensors[2], nullptr };
+    size_t gemm_offsets[3] = { layout.activation_offset, layout.weight_offset, tensor_offsets[2] };
+    ccv_nnc_mfa_encode_gemm(context, gemm_params, command_batch, gemm_tensors, gemm_offsets);
+    {
+      auto encoder = command_batch->startCommand();
+      encoder->setComputePipelineState(dequantize_pipeline->pipeline.get());
+      encoder->useResource(tensors[2], MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+      encoder->useResource(scratch, MTL::ResourceUsageRead);
+      encoder->useResource(tensors[1], MTL::ResourceUsageRead);
+      encoder->setBuffer(tensors[2], tensor_offsets[2], 0);
+      encoder->setBuffer(scratch, layout.scale_offset, 1);
+      encoder->setBuffer(tensors[1], tensor_offsets[1] + weight_scale_offset, 2);
+      encoder->dispatchThreadgroups(dequantize_pipeline->kernel->threadgroupsPerGrid(dequantize_descriptor), dequantize_pipeline->kernel->threadgroupSize);
+      command_batch->finishCommand(encoder);
+    }
+    return;
+  }
+
+  NAInt8MatMulDescriptor matmulDesc;
+  matmulDesc.batchDimension = params.batch_dimension;
+  matmulDesc.ioPrecision = io_precision(params.data_type);
+  matmulDesc.matrixDimensions = simd::uint3 { params.M, params.N, params.K };
+  matmulDesc.loadM = params.loadM;
+  matmulDesc.activationHadamard256 = params.activation_hadamard_256;
+  if (params.leading_dimension_a || params.leading_dimension_c) {
+    CCV_NNC_MFA_PRECONDITION(params.leading_dimension_a && params.leading_dimension_c);
+    matmulDesc.leadingDimensions = simd::uint2 {
+      params.leading_dimension_a,
+      params.leading_dimension_c,
+    };
+  } else {
+    matmulDesc.leadingDimensions = std::nullopt;
+  }
+  if (params.batch_dimension > 1) {
+    simd::uint4 batchStrides;
+    batchStrides[0] = params.batch_stride_a;
+    batchStrides[1] = params.batch_stride_b;
+    batchStrides[2] = params.batch_stride_c;
+    batchStrides[3] = params.batch_stride_d;
+    matmulDesc.batchStrides = batchStrides;
+    matmulDesc.packedABatchStride = params.M * params.K;
+    matmulDesc.aScaleBatchStride = params.M;
+  } else {
+    matmulDesc.batchStrides = std::nullopt;
+  }
+  matmulDesc.useBias = params.fused_bias;
+  // Quantize and consume a bounded row range before moving to the next one.
+  // Large activation and weight working sets benefit from this ordering; small
+  // weight matrices and nearly single-chunk inputs can regress from the extra
+  // dispatches. Require at least two full chunks. These are measured
+  // footprint thresholds, not assumptions about the GPU's physical cache size.
+  // Stay within the measured wide-projection surface (K/N <= 3); deeper,
+  // narrower reductions favored the original traversal with dynamic M.
+  // The K <= 8192 profile already uses a smaller 64-row kernel tile and does
+  // not consistently benefit from adding this second level of partitioning.
+  // Keep batching and strided views on their existing path.
+  // Shared A/C storage can let an output chunk overwrite input rows before
+  // the next chunk quantizes them. Quantize all rows first in that case.
+  const bool partitionRows =
+      !NAInt8MatMulKernelDescriptor(matmulDesc, context->device_properties).useRegisterOperands &&
+      context->device_properties.coreCount >= 36 && params.data_type == MTL::DataTypeHalf &&
+      params.batch_dimension == 1 && !params.leading_dimension_a && !params.leading_dimension_c &&
+      params.M >= 16384 && params.K > 8192 &&
+      uint64_t(params.K) <= uint64_t(3) * params.N &&
+      uint64_t(params.M) * params.K > (uint64_t(128) << 20) &&
+      uint64_t(params.N) * params.K > (uint64_t(64) << 20) &&
+      tensors[0] != tensors[2];
+  const uint32_t M = params.M;
+  const uint32_t rowsPerChunk = partitionRows ? 8192 : M;
+  const uint32_t numChunks = partitionRows ? (uint64_t(M) + 8191) / 8192 : 1;
+  for (uint32_t chunk = 0; chunk < numChunks; ++chunk) {
+    const uint32_t row = chunk * rowsPerChunk;
+    params.M = std::min(rowsPerChunk, M - row);
+    // Re-select for each chunk: bounding M can admit register operands when
+    // the complete packed activation exceeds their 32-bit addressing range.
+    matmulDesc.matrixDimensions[0] = params.M;
+    const size_t activation_offset = tensor_offsets[0] + size_t(row) * params.K * matmulDesc.ioPrecision.size();
+    const size_t output_offset = tensor_offsets[2] + size_t(row) * params.N * matmulDesc.ioPrecision.size();
+    // Source / output batches may be interleaved; packed activations are contiguous.
+    const uint32_t dimensions[] = {
+      params.M, params.batch_stride_a, params.batch_stride_c, params.M * params.K, params.M,
+    };
+
+    auto pool = NS::AutoreleasePool::alloc()->init();
+    auto &shaderCache = context->kernel_cache;
+    const DeviceProperties& dprops = context->device_properties;
+    auto pipelineValue = shaderCache.findKernel<NAInt8MatMulKernel, NAInt8MatMulDescriptor, NAInt8MatMulKernelDescriptor>(matmulDesc, context->device.get(), dprops);
+    pool->drain();
+    auto kernel = pipelineValue->kernel;
+    auto matmulPipeline = pipelineValue->pipeline;
+    auto quantizePipeline = pipelineValue->second;
+
+    const bool useSmallM = use_na_int8_matmul_small_m(params);
+    const ccv_nnc_mfa_activation_quant_layout_t a_layout = activation_quant_layout(params);
+    size_t scratch_bytes = a_layout.scratch_bytes;
+    NAInt8MatMulSmallMDescriptor smallDesc;
+    NAInt8MatMulSmallMScratchOffsets smallOffsets = { 0, 0 };
+    size_t small_scratch_base = 0;
+    if (useSmallM) {
+      smallDesc = make_na_int8_matmul_small_m_descriptor(params);
+      smallOffsets = smallDesc.scratchOffsets();
+      small_scratch_base = align_up(a_layout.scratch_bytes, 256);
+      scratch_bytes = small_scratch_base + smallOffsets.total;
+    }
+    auto scratch = context->request_scratch(scratch_bytes);
+    const uint32_t b_batches = (params.batch_dimension > 1 && params.batch_stride_b > 0) ? params.batch_dimension : 1;
+    const size_t b_scale_offset = rowwise_8i_scale_offset((size_t)b_batches * params.N, params.K);
+
+    {
+      auto encoder = command_batch->startCommand();
+      encoder->setComputePipelineState(quantizePipeline.get());
+      encoder->useResource(tensors[0], MTL::ResourceUsageRead);
+      encoder->useResource(scratch, MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+      encoder->setBuffer(tensors[0], activation_offset, 0);
+      encoder->setBuffer(scratch, 0, 1);
+      encoder->setBuffer(scratch, a_layout.scale_offset, 2);
+      if (matmulDesc.loadM) {
+        encoder->setBytes(dimensions, sizeof(dimensions), 3);
+      }
+      encoder->dispatchThreadgroups(
+          MTL::Size(params.M, 1, params.batch_dimension),
+          MTL::Size(kernel->activationQuantizeThreads, 1, 1));
+      command_batch->finishCommand(encoder);
+    }
+
+    if (useSmallM) {
+      CCV_NNC_MFA_PRECONDITION((params.fused_bias && num_tensors == 4) || (!params.fused_bias && num_tensors == 3));
+      if (METAL_LOG_LEVEL(context) >= 1) {
+        ccv_nnc_mfa_log_message("Using NAX small-M Int8 MatMul.");
+      }
+      auto smallPool = NS::AutoreleasePool::alloc()->init();
+      auto smallPipelineValue = shaderCache.findKernel<NAInt8MatMulSmallMKernel, NAInt8MatMulSmallMDescriptor, NAInt8MatMulSmallMKernelDescriptor>(smallDesc, context->device.get(), dprops);
+      smallPool->drain();
+      auto smallKernel = smallPipelineValue->kernel;
+      const size_t partials_offset = small_scratch_base + smallOffsets.partials;
+      {
+        auto encoder = command_batch->startCommand();
+        encoder->setComputePipelineState(smallPipelineValue->pipeline.get());
+        encoder->useResource(tensors[1], MTL::ResourceUsageRead);
+        encoder->useResource(scratch, MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+        encoder->setBuffer(tensors[1], tensor_offsets[1], 0);
+        encoder->setBuffer(scratch, 0, 1);
+        encoder->setBuffer(scratch, partials_offset, 2);
+        if (smallDesc.loadM) {
+          encoder->setBytes(&params.M, sizeof(params.M), 3);
+        }
+        encoder->dispatchThreadgroups(
+            smallKernel->threadgroupsPerGrid(smallDesc),
+            MTL::Size(smallKernel->threadgroupSize(smallPipelineValue->pipeline.get()), 1, 1));
+        command_batch->finishCommand(encoder);
+      }
+      {
+        auto encoder = command_batch->startCommand();
+        encoder->setComputePipelineState(smallPipelineValue->second.get());
+        encoder->useResource(scratch, MTL::ResourceUsageRead);
+        encoder->useResource(tensors[2], MTL::ResourceUsageWrite);
+        encoder->useResource(tensors[1], MTL::ResourceUsageRead);
+        if (params.fused_bias) {
+          encoder->useResource(tensors[3], MTL::ResourceUsageRead);
+        }
+        encoder->setBuffer(scratch, partials_offset, 0);
+        encoder->setBuffer(tensors[2], output_offset, 1);
+        encoder->setBuffer(scratch, a_layout.scale_offset, 2);
+        encoder->setBuffer(tensors[1], tensor_offsets[1] + b_scale_offset, 3);
+        if (params.fused_bias) {
+          encoder->setBuffer(tensors[3], tensor_offsets[3], 4);
+        }
+        if (smallDesc.loadM) {
+          encoder->setBytes(&params.M, sizeof(params.M), params.fused_bias ? 5 : 4);
+        }
+        encoder->dispatchThreadgroups(
+            MTL::Size((int64_t)(((uint64_t)params.M * params.N + 255) / 256), 1, 1),
+            MTL::Size(256, 1, 1));
+        command_batch->finishCommand(encoder);
+      }
+      continue;
+    }
+
+    {
+      auto encoder = command_batch->startCommand();
+      encoder->setComputePipelineState(matmulPipeline.get());
+      encoder->useResource(scratch, MTL::ResourceUsageRead);
+      encoder->useResource(tensors[1], MTL::ResourceUsageRead);
+      encoder->useResource(tensors[2], MTL::ResourceUsageWrite);
+      if (num_tensors >= 4)
+        encoder->useResource(tensors[3], MTL::ResourceUsageRead);
+      encoder->setBuffer(scratch, 0, 0);
+      encoder->setBuffer(tensors[1], tensor_offsets[1], 1);
+      encoder->setBuffer(tensors[2], output_offset, 2);
+      encoder->setBuffer(scratch, a_layout.scale_offset, 3);
+      encoder->setBuffer(tensors[1], tensor_offsets[1] + b_scale_offset, 4);
+      if (num_tensors >= 4)
+        encoder->setBuffer(tensors[3], tensor_offsets[3], 5);
+      if (matmulDesc.loadM)
+        encoder->setBytes(dimensions, sizeof(dimensions), params.fused_bias ? 6 : 5);
+      encoder->dispatchThreadgroups(
+          kernel->threadgroupsPerGrid(params.M, params.N, params.batch_dimension),
+          kernel->threadsPerThreadgroup(matmulPipeline.get()));
+      command_batch->finishCommand(encoder);
+    }
+  }
+}

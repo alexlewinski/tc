@@ -1,0 +1,734 @@
+#include "NAScaledDotProductArgPartitionKernel.hpp"
+#include "CodeWriter.hpp"
+#include "../ccv_nnc_mfa.hpp"
+
+NAScaledDotProductArgPartitionKernel::NAScaledDotProductArgPartitionKernel(NAScaledDotProductArgPartitionKernelDescriptor descriptor, MTL::Device *const device) {
+  memoryPrecision = descriptor.memoryPrecision;
+  kth = descriptor.kth;
+  scoreMode = descriptor.scoreMode;
+  scoreBlockM = descriptor.scoreBlockM;
+  scoreBlockN = descriptor.scoreBlockN;
+  scoreSIMDGroups = descriptor.scoreSIMDGroups;
+  loadC = descriptor.loadC;
+  loadM = descriptor.loadM;
+  isCausal = descriptor.isCausal;
+  scoreThreadgroupSize = MTL::Size(scoreSIMDGroups * 32, 1, 1);
+  topKThreadgroupSize = MTL::Size(1, 1, 1);
+  topKTileThreadgroupSize = MTL::Size(512, 1, 1);
+  topKMergeThreadgroupSize = MTL::Size(512, 1, 1);
+  source = createSource();
+  auto string = NS::String::string(source.c_str(), NS::UTF8StringEncoding);
+  NS::Error* error = nil;
+  auto options = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
+  // MPP tensor operations require Metal 4, including when built with an older SDK.
+  if (options->languageVersion() < MTL::LanguageVersion(0x40000))
+    options->setLanguageVersion(MTL::LanguageVersion(0x40000));
+  library = NS::TransferPtr(device->newLibrary(string, options.get(), &error));
+  CCV_NNC_MFA_CHECK_ERROR(error);
+}
+
+std::string NAScaledDotProductArgPartitionKernel::createSource() const noexcept {
+  CodeWriter source;
+  source.SetValue("memory_precision", memoryPrecision.name());
+  source.SetValue("kth", std::to_string(kth));
+  source.SetValue("CANDIDATE_INDICES_ARGUMENT", (scoreMode == 1 || scoreMode == 3) ? "  device const int* block_ids [[buffer(5)]],\n" : "");
+  const bool dense = scoreMode == 0 || scoreMode == 4;
+  const std::string topKVisible = dense ? "c < visible" : (scoreMode == 3 ? "c < visible && (uint(block_ids[t * (((C + candidate_block_size - 1) / candidate_block_size + 31) / 32) + (c / candidate_block_size) / 32]) & (1u << ((c / candidate_block_size) % 32))) != 0" : "scores[t * C + c] > -3.402823466e+38f");
+  source.SetValue("TOPK_VISIBLE", topKVisible);
+  source.SetValue("TOPK_SERIAL_FILTER", dense ? "" : "    if (!(" + topKVisible + ")) { continue; }\n");
+  source.SetValue("CANDIDATE_RUNTIME_FIELDS", scoreMode != 0 ? "  uint key_count;\n" : "");
+  source.SetValue("TOPK_LIMIT", dense || scoreMode == 3 ? "visible" : "C");
+  source.SetValue("TOPK_INDEX", scoreMode == 1 ? "block_ids[t * candidate_count + c / candidate_block_size] * int(candidate_block_size) + int(c % candidate_block_size)" : "int(c)");
+  source.SetValue("score_block_m", std::to_string(scoreBlockM));
+  source.SetValue("score_block_n", std::to_string(scoreBlockN));
+  source.SetValue("score_block_d", "128");
+  source.SetValue("score_simdgroups", std::to_string(scoreSIMDGroups));
+  source.SetValue("topk_tile_c", "2048");
+  source.SetValue("topk_threads", "512");
+  source.SetValue("topk_values_per_thread", "4");
+  source.SetValue("topk_sort_values", "2048");
+  source.SetValue("T_FUNCTION_CONSTANT", loadM ? "" : "constant uint T [[function_constant(0)]];\n");
+  source.SetValue("LOAD_M_VALUE", loadM ? "  const uniform<uint> T = make_uniform(runtime_params.T);\n" : "");
+  source.SetValue("TOPK_MERGE_M_ARGUMENT", loadM ? "  constant SDPAPRuntimeParams& runtime_params [[buffer(5)]],\n" : "");
+  source.SetValue("C_FUNCTION_CONSTANT", loadC ? "" : "constant uint C [[function_constant(1)]];\n");
+  source.SetValue("QUERY_OFFSET_FUNCTION_CONSTANT", loadC ? "" : "constant int query_offset [[function_constant(7)]];\n");
+  source.SetValue("LOAD_C_PARAMETER", loadC ? ", uniform<uint> C, uniform<int> query_offset" : "");
+  source.SetValue("VISIBLE_COUNT_FOR_TOKEN", loadC ? "visible_count_for_token(t, C, query_offset)" : "visible_count_for_token(t)");
+  source.SetValue("INDEX_SCORE_C_ARGUMENT", (loadC || loadM) ? "  constant SDPAPRuntimeParams& runtime_params [[buffer(4)]],\n" : "");
+  source.SetValue("TOPK_SERIAL_C_ARGUMENT", (loadC || loadM) ? "  constant SDPAPRuntimeParams& runtime_params [[buffer(2)]],\n" : "");
+  source.SetValue("TOPK_C_ARGUMENT", (loadC || loadM) ? "  constant SDPAPRuntimeParams& runtime_params [[buffer(3)]],\n" : "");
+  source.SetValue("LOAD_C_VALUE", loadC ? "  const uniform<uint> C = make_uniform(runtime_params.C);\n  const uniform<int> query_offset = make_uniform(runtime_params.query_offset);\n" : "");
+  std::string scoreTileCulling;
+  if (isCausal) {
+    const std::string visibleCount = loadC ? "visible_count_for_token(last_t - 1, C, query_offset)" : "visible_count_for_token(last_t - 1)";
+    scoreTileCulling =
+      "  if (t_start >= T) {\n"
+      "    return;\n"
+      "  }\n"
+      "  const uint last_t = min(t_start + uint(" + std::to_string(scoreBlockM) + "), T);\n"
+      "  const uint max_visible = " + visibleCount + ";\n"
+      "  if (c_start >= max_visible) {\n"
+      "    for (uint i = tid; i < " + std::to_string(scoreBlockM * scoreBlockN) + "; i += " + std::to_string(scoreSIMDGroups * 32) + ") {\n"
+      "      const uint row = i / " + std::to_string(scoreBlockN) + ";\n"
+      "      const uint col = i - row * " + std::to_string(scoreBlockN) + ";\n"
+      "      const uint t = t_start + row;\n"
+      "      const uint c = c_start + col;\n"
+      "      if (t < T && c < C) {\n"
+      "        scores[t * C + c] = -3.402823466e+38f;\n"
+      "      }\n"
+      "    }\n"
+      "    return;\n"
+      "  }\n";
+  }
+  source.SetValue("SCORE_TILE_CULLING", scoreTileCulling);
+  source += R"(
+#include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+typedef {{memory_precision}} real;
+
+{{T_FUNCTION_CONSTANT}}{{C_FUNCTION_CONSTANT}}constant uint H [[function_constant(2)]];
+constant uint D [[function_constant(3)]];
+constant uint compression_ratio [[function_constant(4)]];
+constant bool is_causal [[function_constant(5)]];
+constant float scale [[function_constant(6)]];
+{{QUERY_OFFSET_FUNCTION_CONSTANT}}
+
+struct SDPAPRuntimeParams {
+  uint C;
+  int query_offset;
+  uint T;
+{{CANDIDATE_RUNTIME_FIELDS}}};
+)";
+  if (scoreMode != 0) {
+    source += R"(
+constant uint candidate_block_size [[function_constant(8)]];
+constant uint candidate_count [[function_constant(9)]];
+inline uint candidate_visible(uint t, constant SDPAPRuntimeParams& p) {
+  return is_causal ? uint(clamp((p.query_offset + int(t) + 1) / int(compression_ratio), 0, int(p.key_count))) : p.key_count;
+}
+)";
+  }
+  source += R"(
+inline uint visible_count_for_token(uint t{{LOAD_C_PARAMETER}}) {
+  if (!is_causal) {
+    return C;
+  }
+  int visible = (query_offset + int(t) + 1) / int(compression_ratio);
+  visible = max(visible, 0);
+  visible = min(visible, int(C));
+  return uint(visible);
+}
+
+inline bool better_pair(float lhs_score, int lhs_idx, float rhs_score, int rhs_idx) {
+  if (lhs_idx < 0) {
+    return false;
+  }
+  if (rhs_idx < 0) {
+    return true;
+  }
+  return lhs_score > rhs_score || (lhs_score == rhs_score && lhs_idx < rhs_idx);
+}
+
+inline void thread_sort4(thread float (&scores)[{{topk_values_per_thread}}], thread int (&indices)[{{topk_values_per_thread}}]) {
+  #pragma clang loop unroll(full)
+  for (ushort i = 0; i < {{topk_values_per_thread}}; ++i) {
+    #pragma clang loop unroll(full)
+    for (ushort j = i & 1; j < {{topk_values_per_thread}} - 1; j += 2) {
+      if (better_pair(scores[j + 1], indices[j + 1], scores[j], indices[j])) {
+        const float score = scores[j];
+        const int index = indices[j];
+        scores[j] = scores[j + 1];
+        indices[j] = indices[j + 1];
+        scores[j + 1] = score;
+        indices[j + 1] = index;
+      }
+    }
+  }
+}
+
+inline short merge_partition_pairs(
+  threadgroup const float* a_scores,
+  threadgroup const int* a_indices,
+  threadgroup const float* b_scores,
+  threadgroup const int* b_indices,
+  short a_size,
+  short b_size,
+  short sort_mid
+) {
+  short a_start = max(short(0), short(sort_mid - b_size));
+  short a_end = min(sort_mid, a_size);
+  while (a_start < a_end) {
+    const short mid = a_start + (a_end - a_start) / 2;
+    const short b_pos = sort_mid - 1 - mid;
+    if (better_pair(b_scores[b_pos], b_indices[b_pos], a_scores[mid], a_indices[mid])) {
+      a_end = mid;
+    } else {
+      a_start = mid + 1;
+    }
+  }
+  return a_end;
+}
+
+inline void merge_pair_at(
+  threadgroup const float* a_scores,
+  threadgroup const int* a_indices,
+  threadgroup const float* b_scores,
+  threadgroup const int* b_indices,
+  short a_size,
+  short b_size,
+  short rank,
+  thread float& score,
+  thread int& index
+) {
+  const short a_pos = merge_partition_pairs(a_scores, a_indices, b_scores, b_indices, a_size, b_size, rank);
+  const short b_pos = rank - a_pos;
+  const bool take_b = b_pos < b_size && (a_pos >= a_size || better_pair(b_scores[b_pos], b_indices[b_pos], a_scores[a_pos], a_indices[a_pos]));
+  if (take_b) {
+    score = b_scores[b_pos];
+    index = b_indices[b_pos];
+  } else if (a_pos < a_size) {
+    score = a_scores[a_pos];
+    index = a_indices[a_pos];
+  } else {
+    score = -3.402823466e+38f;
+    index = -1;
+  }
+}
+
+inline void merge_step_pairs(
+  threadgroup const float* a_scores,
+  threadgroup const int* a_indices,
+  threadgroup const float* b_scores,
+  threadgroup const int* b_indices,
+  short a_size,
+  short b_size,
+  thread float (&scores)[{{topk_values_per_thread}}],
+  thread int (&indices)[{{topk_values_per_thread}}]
+) {
+  short a_pos = 0;
+  short b_pos = 0;
+  #pragma clang loop unroll(full)
+  for (ushort i = 0; i < {{topk_values_per_thread}}; ++i) {
+    const bool take_b = b_pos < b_size && (a_pos >= a_size || better_pair(b_scores[b_pos], b_indices[b_pos], a_scores[a_pos], a_indices[a_pos]));
+    if (take_b) {
+      scores[i] = b_scores[b_pos];
+      indices[i] = b_indices[b_pos];
+      ++b_pos;
+    } else if (a_pos < a_size) {
+      scores[i] = a_scores[a_pos];
+      indices[i] = a_indices[a_pos];
+      ++a_pos;
+    } else {
+      scores[i] = -3.402823466e+38f;
+      indices[i] = -1;
+    }
+  }
+}
+
+inline void block_merge_sort_pairs(threadgroup float* group_scores, threadgroup int* group_indices, ushort tid) {
+  const ushort base = tid * {{topk_values_per_thread}};
+  thread float local_scores[{{topk_values_per_thread}}];
+  thread int local_indices[{{topk_values_per_thread}}];
+  #pragma clang loop unroll(full)
+  for (ushort i = 0; i < {{topk_values_per_thread}}; ++i) {
+    local_scores[i] = group_scores[base + i];
+    local_indices[i] = group_indices[base + i];
+  }
+  thread_sort4(local_scores, local_indices);
+  for (ushort merge_threads = 2; merge_threads <= {{topk_threads}}; merge_threads <<= 1) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < {{topk_values_per_thread}}; ++i) {
+      group_scores[base + i] = local_scores[i];
+      group_indices[base + i] = local_indices[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const ushort merge_group = tid / merge_threads;
+    const ushort merge_lane = tid - merge_group * merge_threads;
+    const short sort_size = {{topk_values_per_thread}} * merge_threads;
+    const short sort_start = sort_size * merge_group;
+    threadgroup const float* a_scores = group_scores + sort_start;
+    threadgroup const int* a_indices = group_indices + sort_start;
+    threadgroup const float* b_scores = group_scores + sort_start + sort_size / 2;
+    threadgroup const int* b_indices = group_indices + sort_start + sort_size / 2;
+    const short sort_mid = {{topk_values_per_thread}} * merge_lane;
+    short a_size = min(short(sort_size / 2), short({{kth}}));
+    short b_size = a_size;
+    if (sort_mid < {{kth}}) {
+      const short partition = merge_partition_pairs(a_scores, a_indices, b_scores, b_indices, a_size, b_size, sort_mid);
+      a_scores += partition;
+      a_indices += partition;
+      b_scores += sort_mid - partition;
+      b_indices += sort_mid - partition;
+      a_size -= partition;
+      b_size -= sort_mid - partition;
+      merge_step_pairs(a_scores, a_indices, b_scores, b_indices, a_size, b_size, local_scores, local_indices);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  #pragma clang loop unroll(full)
+  for (ushort i = 0; i < {{topk_values_per_thread}}; ++i) {
+    group_scores[base + i] = local_scores[i];
+    group_indices[base + i] = local_indices[i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+)";
+  if (scoreMode == 1) {
+    source += R"(
+kernel void index_score(
+  device real* q [[buffer(0)]],
+  device const real* k [[buffer(1)]],
+  device const real* head_w [[buffer(2)]],
+  device float* scores [[buffer(3)]],
+  constant SDPAPRuntimeParams& runtime_params [[buffer(4)]],
+  device const int* block_ids [[buffer(5)]],
+  ushort lane [[thread_index_in_simdgroup]],
+  uint2 tgid [[threadgroup_position_in_grid]]
+) {
+  const uint t = tgid.y;
+  const uint start = tgid.x * 32;
+  const uint visible = candidate_visible(t, runtime_params);
+  const uint c = start + lane;
+  const int block = c < runtime_params.C ? block_ids[t * candidate_count + c / candidate_block_size] : -1;
+  const uint row = uint(max(block, 0)) * candidate_block_size + c % candidate_block_size;
+  const bool valid = c < runtime_params.C && block >= 0 && row < visible;
+  threadgroup real keys[32 * 128];
+  threadgroup float dots[16 * 32];
+  for (uint i = lane; i < 32 * 128; i += 32) {
+    const uint pos = start + i / 128;
+    const int b = pos < runtime_params.C ? block_ids[t * candidate_count + pos / candidate_block_size] : -1;
+    const uint r = uint(max(b, 0)) * candidate_block_size + pos % candidate_block_size;
+    keys[i] = b >= 0 && r < visible ? k[r * D + i % 128] : real(0);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  auto Q = tensor<device real, dextents<int32_t, 2>, tensor_inline>(q + t * H * D, dextents<int32_t, 2>(D, H));
+  auto K = tensor<threadgroup real, dextents<int32_t, 2>, tensor_inline>(keys, extents<int32_t, 128, 32>());
+  constexpr auto desc = matmul2d_descriptor(16, 32, 128, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<1>> op;
+  auto mQ0 = Q.slice<128, 16>(0, 0);
+  auto mK = K.slice<128, 32>(0, 0);
+  auto dot = op.get_destination_cooperative_tensor<decltype(mQ0), decltype(mK), float>();
+  float score = 0;
+  for (uint h = 0; h < H; h += 16) {
+    for (ushort i = 0; i < dot.get_capacity(); ++i) {
+      if (dot.is_valid_element(i)) { dot[i] = 0; }
+    }
+    auto mQ = Q.slice<128, 16>(0, h);
+    op.run(mQ, mK, dot);
+    for (ushort i = 0; i < dot.get_capacity(); ++i) {
+      if (dot.is_valid_element(i)) {
+        auto idx = dot.get_multidimensional_index(i);
+        dots[idx[1] * 32 + idx[0]] = dot[i];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = 0; j < min(16u, H - h); ++j) {
+      score += max(dots[j * 32 + lane], 0.0f) * float(head_w[t * H + h + j]) * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (c < runtime_params.C) {
+    scores[t * runtime_params.C + c] = valid ? score : -3.402823466e+38f;
+  }
+}
+)";
+  } else if (scoreMode == 2) {
+    source += R"(
+kernel void index_score(
+  device const float* scores [[buffer(0)]],
+  device float* block_scores [[buffer(3)]],
+  constant SDPAPRuntimeParams& runtime_params [[buffer(4)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  const uint block = gid.x;
+  const uint t = gid.y;
+  if (block >= runtime_params.C || t >= runtime_params.T) { return; }
+  const uint keys = runtime_params.key_count;
+  const uint visible = candidate_visible(t, runtime_params);
+  const uint start = block * candidate_block_size;
+  float score = -3.402823466e+38f;
+  for (uint c = start; c < min(start + candidate_block_size, visible); ++c) {
+    score = max(score, scores[t * keys + c]);
+  }
+  if (visible > 0 && block == (visible - 1) / candidate_block_size) {
+    score = INFINITY;
+  }
+  block_scores[t * runtime_params.C + block] = score;
+}
+)";
+  } else {
+    source += R"(
+kernel void index_score(
+  device real* q [[buffer(0)]],
+  device real* k [[buffer(1)]],
+  device const real* head_w [[buffer(2)]],
+  device float* scores [[buffer(3)]],
+{{INDEX_SCORE_C_ARGUMENT}}  ushort tid [[thread_index_in_threadgroup]],
+  ushort sgid [[simdgroup_index_in_threadgroup]],
+  uint2 tgid [[threadgroup_position_in_grid]]
+) {
+{{LOAD_C_VALUE}}{{LOAD_M_VALUE}}  const uint c_start = tgid.x * {{score_block_n}};
+  const uint t_start = tgid.y * {{score_block_m}};
+{{SCORE_TILE_CULLING}}  auto Q = tensor<device real, dextents<int32_t, 2>, tensor_inline>(q, dextents<int32_t, 2>(H * D, T));
+  auto K = tensor<device real, dextents<int32_t, 2>, tensor_inline>(k, dextents<int32_t, 2>(D, C));
+  constexpr auto score_desc = matmul2d_descriptor({{score_block_m}}, {{score_block_n}}, {{score_block_d}}, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<score_desc, execution_simdgroups<1>> score_matmul_op;
+  auto mQ0 = Q.slice<{{score_block_d}}, {{score_block_m}}>(sgid * D, t_start);
+  auto mK0 = K.slice<{{score_block_d}}, {{score_block_n}}>(0, c_start);
+  auto cAccum = score_matmul_op.get_destination_cooperative_tensor<decltype(mQ0), decltype(mK0), float>();
+  auto cDot = score_matmul_op.get_destination_cooperative_tensor<decltype(mQ0), decltype(mK0), float>();
+  #pragma clang loop unroll(full)
+  for (ushort i = 0; i < cAccum.get_capacity(); ++i) {
+    if (cAccum.is_valid_element(i)) {
+      cAccum[i] = 0;
+    }
+  }
+  for (uint h = sgid; h < H; h += {{score_simdgroups}}) {
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < cDot.get_capacity(); ++i) {
+      if (cDot.is_valid_element(i)) {
+        cDot[i] = 0;
+      }
+    }
+    auto mQ = Q.slice<{{score_block_d}}, {{score_block_m}}>(h * D, t_start);
+    auto mK = K.slice<{{score_block_d}}, {{score_block_n}}>(0, c_start);
+    score_matmul_op.run(mQ, mK, cDot);
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < cDot.get_capacity(); ++i) {
+      if (cDot.is_valid_element(i)) {
+        auto idx = cDot.get_multidimensional_index(i);
+        const uint t = t_start + idx[1];
+        if (t < T) {
+          const float dot = cDot[i];
+          if (dot > 0) {
+            cAccum[i] += dot * float(head_w[t * H + h]) * scale;
+          }
+        }
+      }
+    }
+  }
+  threadgroup float partial_scores[{{score_simdgroups}} * {{score_block_m}} * {{score_block_n}}];
+  #pragma clang loop unroll(full)
+  for (ushort i = 0; i < cAccum.get_capacity(); ++i) {
+    if (cAccum.is_valid_element(i)) {
+      auto idx = cAccum.get_multidimensional_index(i);
+      partial_scores[(uint(sgid) * {{score_block_m}} + idx[1]) * {{score_block_n}} + idx[0]] = cAccum[i];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = tid; i < {{score_block_m}} * {{score_block_n}}; i += {{score_simdgroups}} * 32) {
+    const uint row = i / {{score_block_n}};
+    const uint col = i - row * {{score_block_n}};
+    const uint t = t_start + row;
+    const uint c = c_start + col;
+    if (t < T && c < C) {
+      const uint visible = {{VISIBLE_COUNT_FOR_TOKEN}};
+      float score = -3.402823466e+38f;
+      if (c < visible) {
+        score = 0;
+        #pragma clang loop unroll(full)
+        for (ushort sg = 0; sg < {{score_simdgroups}}; ++sg) {
+          score += partial_scores[(uint(sg) * {{score_block_m}} + row) * {{score_block_n}} + col];
+        }
+      }
+      scores[t * C + c] = score;
+    }
+  }
+}
+
+)";
+  }
+  source += R"(
+kernel void topk_serial(
+{{CANDIDATE_INDICES_ARGUMENT}}  device const float* scores [[buffer(0)]],
+  device int* selected [[buffer(1)]],
+{{TOPK_SERIAL_C_ARGUMENT}}  uint t [[thread_position_in_grid]]
+) {
+{{LOAD_C_VALUE}}{{LOAD_M_VALUE}}  if (t >= T) {
+    return;
+  }
+  float top_scores[{{kth}}];
+  int top_indices[{{kth}}];
+  for (uint i = 0; i < {{kth}}; ++i) {
+    top_scores[i] = -3.402823466e+38f;
+    top_indices[i] = -1;
+    selected[t * {{kth}} + i] = -1;
+  }
+  const uint visible = {{VISIBLE_COUNT_FOR_TOKEN}};
+  uint top_count = 0;
+  for (uint c = 0; c < {{TOPK_LIMIT}}; ++c) {
+{{TOPK_SERIAL_FILTER}}    const float score = scores[t * C + c];
+    if (top_count == {{kth}} && !better_pair(score, {{TOPK_INDEX}}, top_scores[{{kth}} - 1], top_indices[{{kth}} - 1])) {
+      continue;
+    }
+    uint pos = top_count < {{kth}} ? top_count++ : {{kth}} - 1;
+    while (pos > 0 && better_pair(score, {{TOPK_INDEX}}, top_scores[pos - 1], top_indices[pos - 1])) {
+      top_scores[pos] = top_scores[pos - 1];
+      top_indices[pos] = top_indices[pos - 1];
+      --pos;
+    }
+    top_scores[pos] = score;
+    top_indices[pos] = {{TOPK_INDEX}};
+  }
+  const uint write_count = min(top_count, uint({{kth}}));
+  for (uint i = 0; i < write_count; ++i) {
+    selected[t * {{kth}} + i] = top_indices[i];
+  }
+}
+
+kernel void topk_tile(
+{{CANDIDATE_INDICES_ARGUMENT}}  device const float* scores [[buffer(0)]],
+  device float* candidate_scores [[buffer(1)]],
+  device int* candidate_indices [[buffer(2)]],
+{{TOPK_C_ARGUMENT}}  uint2 tgid [[threadgroup_position_in_grid]],
+  uint tid [[thread_index_in_threadgroup]]
+) {
+{{LOAD_C_VALUE}}{{LOAD_M_VALUE}}  const uint tile = tgid.x;
+  const uint t = tgid.y;
+  if (t >= T) {
+    return;
+  }
+  threadgroup float tile_scores[{{topk_sort_values}}];
+  threadgroup int tile_indices[{{topk_sort_values}}];
+  const uint c_start = tile * {{topk_tile_c}};
+  const uint visible = {{VISIBLE_COUNT_FOR_TOKEN}};
+  for (uint i = tid; i < {{topk_sort_values}}; i += {{topk_threads}}) {
+    const uint c = c_start + i;
+    if (c < C && {{TOPK_VISIBLE}}) {
+      tile_scores[i] = scores[t * C + c];
+      tile_indices[i] = {{TOPK_INDEX}};
+    } else {
+      tile_scores[i] = -3.402823466e+38f;
+      tile_indices[i] = -1;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  block_merge_sort_pairs(tile_scores, tile_indices, tid);
+  const uint num_tiles = (C + {{topk_tile_c}} - 1) / {{topk_tile_c}};
+  const uint out_base = (t * num_tiles + tile) * {{kth}};
+  for (uint i = tid; i < {{kth}}; i += {{topk_threads}}) {
+    candidate_scores[out_base + i] = tile_scores[i];
+    candidate_indices[out_base + i] = tile_indices[i];
+  }
+}
+
+)";
+  if (scoreMode != 0 && kth > 512) {
+    source += R"(
+kernel void topk_merge(
+  device const float* candidate_scores [[buffer(0)]],
+  device const int* candidate_indices [[buffer(1)]],
+  device float* reduced_scores [[buffer(2)]],
+  device int* reduced_indices [[buffer(3)]],
+  constant uint& num_lists [[buffer(4)]],
+{{TOPK_MERGE_M_ARGUMENT}}  uint2 tgid [[threadgroup_position_in_grid]],
+  uint tid [[thread_index_in_threadgroup]]
+) {
+{{LOAD_M_VALUE}}  const uint first = tgid.x * 2;
+  const uint lists = min(num_lists - first, 2u);
+  const uint in_base = (tgid.y * num_lists + first) * {{kth}};
+  const uint out_base = (tgid.y * ((num_lists + 1) / 2) + tgid.x) * {{kth}};
+  threadgroup float s[2 * {{kth}}];
+  threadgroup int ids[2 * {{kth}}];
+  for (uint i = tid; i < lists * {{kth}}; i += 512) {
+    s[i] = candidate_scores[in_base + i];
+    ids[i] = candidate_indices[in_base + i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = tid; i < {{kth}}; i += 512) {
+    float score; int index;
+    merge_pair_at(s, ids, s + {{kth}}, ids + {{kth}}, {{kth}}, lists == 2 ? {{kth}} : 0, short(i), score, index);
+    reduced_scores[out_base + i] = score;
+    reduced_indices[out_base + i] = index;
+  }
+}
+)";
+  } else {
+    source += R"(
+kernel void topk_merge(
+  device const float* candidate_scores [[buffer(0)]],
+  device const int* candidate_indices [[buffer(1)]],
+  device float* reduced_scores [[buffer(2)]],
+  device int* reduced_indices [[buffer(3)]],
+  constant uint& num_lists [[buffer(4)]],
+{{TOPK_MERGE_M_ARGUMENT}}  uint2 tgid [[threadgroup_position_in_grid]],
+  uint tid [[thread_index_in_threadgroup]]
+) {
+{{LOAD_M_VALUE}}  const uint group = tgid.x;
+  const uint t = tgid.y;
+  if (t >= T) {
+    return;
+  }
+  const uint first_list = group * 4;
+  const uint list_count = min(num_lists - first_list, 4u);
+  const uint in_base = (t * num_lists + first_list) * {{kth}};
+  const uint output_lists = (num_lists + 3) / 4;
+  const uint out_base = (t * output_lists + group) * {{kth}};
+  if (list_count == 1) {
+    for (uint i = tid; i < {{kth}}; i += {{topk_threads}}) {
+      reduced_scores[out_base + i] = candidate_scores[in_base + i];
+      reduced_indices[out_base + i] = candidate_indices[in_base + i];
+    }
+    return;
+  }
+  threadgroup float merge_scores[{{topk_sort_values}}];
+  threadgroup int merge_indices[{{topk_sort_values}}];
+  const uint merge_count = list_count * {{kth}};
+  for (uint i = tid; i < merge_count; i += {{topk_threads}}) {
+    merge_scores[i] = candidate_scores[in_base + i];
+    merge_indices[i] = candidate_indices[in_base + i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  thread float pair_scores[2];
+  thread int pair_indices[2];
+  if (tid < {{kth}}) {
+    merge_pair_at(merge_scores, merge_indices, merge_scores + {{kth}}, merge_indices + {{kth}}, {{kth}}, {{kth}}, short(tid), pair_scores[0], pair_indices[0]);
+    if (list_count <= 2) {
+      reduced_scores[out_base + tid] = pair_scores[0];
+      reduced_indices[out_base + tid] = pair_indices[0];
+    } else {
+      merge_pair_at(merge_scores + 2 * {{kth}}, merge_indices + 2 * {{kth}}, merge_scores + 3 * {{kth}}, merge_indices + 3 * {{kth}}, {{kth}}, list_count == 4 ? {{kth}} : 0, short(tid), pair_scores[1], pair_indices[1]);
+    }
+  }
+  if (list_count <= 2) {
+    return;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < {{kth}}) {
+    merge_scores[tid] = pair_scores[0];
+    merge_indices[tid] = pair_indices[0];
+    merge_scores[{{kth}} + tid] = pair_scores[1];
+    merge_indices[{{kth}} + tid] = pair_indices[1];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < {{kth}}) {
+    float score;
+    int index;
+    merge_pair_at(merge_scores, merge_indices, merge_scores + {{kth}}, merge_indices + {{kth}}, {{kth}}, {{kth}}, short(tid), score, index);
+    reduced_scores[out_base + tid] = score;
+    reduced_indices[out_base + tid] = index;
+  }
+}
+)";
+  }
+  if (scoreMode != 0) {
+    source += R"(
+kernel void index_ids(
+  device const int* input [[buffer(0)]],
+  device int* output [[buffer(1)]],
+  constant SDPAPRuntimeParams& runtime_params [[buffer(2)]],
+  constant uint2& options [[buffer(3)]],
+  uint t [[threadgroup_position_in_grid]],
+  uint tid [[thread_index_in_threadgroup]]
+) {
+  const uint length = options.x;
+  const uint mode = options.y; // 0: normalize, 1: sort, 2: enumerate rows, 3: bitset, 4: enumerate blocks, 5: enumerate restricted rows.
+  threadgroup int ids[2048];
+  if (mode == 5 && candidate_block_size > 0) { // C <= kth <= 1024: enumerate the pool's eligible rows.
+    const uint visible = candidate_visible(t, runtime_params);
+    const uint blocks = (visible + candidate_block_size - 1) / candidate_block_size;
+    // Produced full pools begin with every visible block in order. Check that
+    // prefix on the GPU so arbitrary external pools still take the filtering path.
+    bool complete = candidate_count >= blocks;
+    if (complete) {
+      for (uint i = tid; i < blocks; i += 256) { complete &= input[t * candidate_count + i] == int(i); }
+    }
+    const bool simd_complete = simd_all(complete);
+    if (tid % 32 == 0) { ids[tid / 32] = simd_complete; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    complete = true;
+    for (uint i = 0; i < 8; ++i) { complete &= ids[i] != 0; }
+    if (complete) {
+      for (uint i = tid; i < length; i += 256) { output[t * length + i] = i < visible ? int(i) : -1; }
+      return;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup atomic_uint* bits = reinterpret_cast<threadgroup atomic_uint*>(ids);
+    if (tid < 32) { atomic_store_explicit(bits + tid, 0, memory_order_relaxed); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < candidate_count; i += 256) {
+      const int id = input[t * candidate_count + i];
+      if (id >= 0 && uint(id) < blocks) {
+        atomic_fetch_or_explicit(bits + uint(id) / 32, 1u << (uint(id) % 32), memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint count = 0;
+    for (uint word = 0; word < (blocks + 31) / 32; ++word) {
+      count += popcount(atomic_load_explicit(bits + word, memory_order_relaxed)) * candidate_block_size;
+    }
+    if (visible % candidate_block_size != 0 &&
+        (atomic_load_explicit(bits + (blocks - 1) / 32, memory_order_relaxed) & (1u << ((blocks - 1) % 32))) != 0) {
+      count -= candidate_block_size - visible % candidate_block_size;
+    }
+    for (uint row = tid; row < visible; row += 256) {
+      const uint block = row / candidate_block_size;
+      const uint word = block / 32;
+      const uint mask = 1u << (block % 32);
+      const uint value = atomic_load_explicit(bits + word, memory_order_relaxed);
+      if ((value & mask) != 0) {
+        uint preceding = popcount(value & (mask - 1));
+        for (uint i = 0; i < word; ++i) {
+          preceding += popcount(atomic_load_explicit(bits + i, memory_order_relaxed));
+        }
+        output[t * length + preceding * candidate_block_size + row % candidate_block_size] = int(row);
+      }
+    }
+    for (uint i = count + tid; i < length; i += 256) { output[t * length + i] = -1; }
+    return;
+  }
+  if (mode == 3 && candidate_block_size > 0) { // Dense-reader membership bitset; duplicates are idempotent.
+    const uint blocks = (runtime_params.key_count + candidate_block_size - 1) / candidate_block_size;
+    const uint words = (blocks + 31) / 32;
+    device atomic_uint* bits = reinterpret_cast<device atomic_uint*>(output) + t * words;
+    for (uint i = tid; i < words; i += 256) { atomic_store_explicit(bits + i, 0, memory_order_relaxed); }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint i = tid; i < length; i += 256) {
+      const int id = input[t * length + i];
+      if (id >= 0 && uint(id) < blocks) { atomic_fetch_or_explicit(bits + uint(id) / 32, 1u << (uint(id) % 32), memory_order_relaxed); }
+    }
+    return;
+  }
+  if (mode == 2 || mode == 4) {
+    const uint visible = candidate_visible(t, runtime_params);
+    const uint count = mode == 4 && candidate_block_size > 0 ? (visible + candidate_block_size - 1) / candidate_block_size : visible;
+    for (uint i = tid; i < length; i += 256) { output[t * length + i] = i < count ? int(i) : -1; }
+    return;
+  }
+  uint width = 1;
+  while (width < length) { width *= 2; }
+  const uint blocks = candidate_block_size > 0 ? (runtime_params.key_count + candidate_block_size - 1) / candidate_block_size : 0;
+  for (uint i = tid; i < width; i += 256) {
+    const int id = i < length ? input[t * length + i] : -1;
+    ids[i] = id < 0 || (mode == 0 && uint(id) >= blocks) ? 2147483647 : id;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint k = 2; k <= width; k *= 2) {
+    for (uint j = k / 2; j > 0; j /= 2) {
+      for (uint i = tid; i < width; i += 256) {
+        const uint other = i ^ j;
+        if (other > i) {
+          const int a = ids[i], b = ids[other];
+          const bool ascending = (i & k) == 0;
+          ids[i] = ascending ? min(a, b) : max(a, b);
+          ids[other] = ascending ? max(a, b) : min(a, b);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+  for (uint i = tid; i < length; i += 256) {
+    const int id = ids[i];
+    output[t * length + i] = id == 2147483647 || (mode == 0 && i > 0 && id == ids[i - 1]) ? -1 : id;
+  }
+}
+)";
+  }
+  return source.ToString();
+}

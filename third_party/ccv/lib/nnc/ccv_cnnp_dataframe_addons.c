@@ -1,0 +1,853 @@
+#include "ccv_nnc.h"
+#include "ccv_nnc_easy.h"
+#include "ccv_nnc_internal.h"
+#include "ccv_internal.h"
+#include "_ccv_cnnp_dataframe.h"
+#include "3rdparty/sfmt/SFMT.h"
+
+// MARK - Create Dataframe from Array
+
+static void _ccv_cnnp_array_enum(const int column_idx, const int* const row_idxs, const int row_size, void** const data, void* const context, ccv_nnc_stream_context_t* const stream_context)
+{
+	int i;
+	ccv_array_t* const array = (ccv_array_t*)context;
+	for (i = 0; i < row_size; i++)
+		data[i] = ccv_array_get(array, row_idxs[i]);
+}
+
+ccv_cnnp_dataframe_t* ccv_cnnp_dataframe_from_array_new(ccv_array_t* const array)
+{
+	const ccv_cnnp_column_data_t array_column_data = {
+		.data_enum = _ccv_cnnp_array_enum,
+		.context = array
+	};
+	return ccv_cnnp_dataframe_new(&array_column_data, 1, array->rnum);
+}
+
+typedef struct {
+	ccv_cnnp_dataframe_tuple_t tuple;
+	int tensor_offset;
+	int device_id;
+} ccv_cnnp_copy_to_gpu_context_t;
+
+// MARK - Copy Tensors from CPU to GPU
+
+static void _ccv_cnnp_tensor_list_deinit(void* const data, void* const context)
+{
+	ccv_cnnp_dataframe_tuple_t* const tuple = (ccv_cnnp_dataframe_tuple_t*)context;
+	ccv_nnc_tensor_t** const tensor_list = (ccv_nnc_tensor_t**)data;
+	int i;
+	for (i = 0; i < tuple->size; i++)
+		if (tensor_list[i])
+			ccv_nnc_tensor_free(tensor_list[i]);
+	ccfree(tensor_list);
+}
+
+static void _ccv_cnnp_copy_to_gpu(void* const* const* const column_data, const int column_size, const int batch_size, void** const data, void* const context, ccv_nnc_stream_context_t* const stream_context)
+{
+	const ccv_cnnp_copy_to_gpu_context_t* const copy_to_gpu_context = (ccv_cnnp_copy_to_gpu_context_t*)context;
+	int i, j;
+	for (i = 0; i < batch_size; i++)
+	{
+		ccv_nnc_tensor_t* const* const inputs = (ccv_nnc_tensor_t* const*)column_data[0][i] + copy_to_gpu_context->tensor_offset;
+		ccv_nnc_tensor_t** outputs = (ccv_nnc_tensor_t**)data[i];
+		if (!outputs)
+			outputs = (ccv_nnc_tensor_t**)(data[i] = cccalloc(copy_to_gpu_context->tuple.size, sizeof(ccv_nnc_tensor_t*)));
+		for (j = 0; j < copy_to_gpu_context->tuple.size; j++)
+		{
+			ccv_nnc_tensor_param_t params = inputs[j]->info;
+			params.type &= ~CCV_TENSOR_CPU_MEMORY;
+			params.type |= CCV_TENSOR_GPU_MEMORY; // Change to GPU memory.
+			CCV_TENSOR_SET_DEVICE_ID(params.type, copy_to_gpu_context->device_id);
+			outputs[j] = outputs[j] ? ccv_nnc_tensor_resize(outputs[j], params) : ccv_nnc_tensor_new(0, params, 0);
+			ccv_nnc_tensor_pin_memory(inputs[j]);
+		}
+		ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, inputs, copy_to_gpu_context->tuple.size, outputs, copy_to_gpu_context->tuple.size, stream_context);
+	}
+}
+
+int ccv_cnnp_dataframe_copy_to_gpu(ccv_cnnp_dataframe_t* const dataframe, const int column_idx, const int tensor_offset, const int tensor_size, const int device_id, const char* name)
+{
+	assert(tensor_size > 0);
+	int stream_type = CCV_STREAM_CONTEXT_GPU;
+	CCV_STREAM_SET_DEVICE_ID(stream_type, device_id);
+	ccv_cnnp_copy_to_gpu_context_t* const copy_to_gpu_context = (ccv_cnnp_copy_to_gpu_context_t*)ccmalloc(sizeof(ccv_cnnp_copy_to_gpu_context_t));
+	copy_to_gpu_context->tuple.size = tensor_size;
+	copy_to_gpu_context->tensor_offset = tensor_offset;
+	copy_to_gpu_context->device_id = device_id;
+	return ccv_cnnp_dataframe_map(dataframe, _ccv_cnnp_copy_to_gpu, stream_type, _ccv_cnnp_tensor_list_deinit, COLUMN_ID_LIST(column_idx), copy_to_gpu_context, (ccv_cnnp_column_data_context_deinit_f)ccfree, name);
+}
+
+// MARK - Use Command to Generate Output Tuple
+
+typedef struct {
+	ccv_cnnp_dataframe_tuple_t tuple;
+	int input_offset;
+	int input_size;
+	ccv_nnc_cmd_t cmd;
+	ccv_nnc_hint_t hint;
+	int flags;
+	ccv_nnc_tensor_param_t output_params[1];
+} ccv_cnnp_cmd_exec_context_t;
+
+static void _ccv_cnnp_dataframe_cmd_exec(void* const* const* const column_data, const int column_size, const int batch_size, void** const data, void* const context, ccv_nnc_stream_context_t* const stream_context)
+{
+	const ccv_cnnp_cmd_exec_context_t* const cmd_exec_context = (ccv_cnnp_cmd_exec_context_t*)context;
+	int i, j;
+	for (i = 0; i < batch_size; i++)
+	{
+		ccv_nnc_tensor_t* const* const inputs = (ccv_nnc_tensor_t* const*)column_data[0][i] + cmd_exec_context->input_offset;
+		ccv_nnc_tensor_t** outputs = (ccv_nnc_tensor_t**)data[i];
+		if (!outputs)
+		{
+			outputs = (ccv_nnc_tensor_t**)(data[i] = ccmalloc(sizeof(ccv_nnc_tensor_t*) * cmd_exec_context->tuple.size));
+			for (j = 0; j < cmd_exec_context->tuple.size; j++)
+				outputs[j] = ccv_nnc_tensor_new(0, cmd_exec_context->output_params[j], 0);
+		}
+		ccv_nnc_cmd_exec(cmd_exec_context->cmd, cmd_exec_context->hint, cmd_exec_context->flags, inputs, cmd_exec_context->input_size, outputs, cmd_exec_context->tuple.size, stream_context);
+	}
+}
+
+int ccv_cnnp_dataframe_cmd_exec(ccv_cnnp_dataframe_t* const dataframe, const int column_idx, const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint, const int flags, const int input_offset, const int input_size, const ccv_nnc_tensor_param_t* const output_params, const int output_size, const int stream_type, const char* name)
+{
+	assert(input_size > 0);
+	assert(output_size > 0);
+	ccv_cnnp_cmd_exec_context_t* const cmd_exec_context = (ccv_cnnp_cmd_exec_context_t*)ccmalloc(sizeof(ccv_cnnp_cmd_exec_context_t) + sizeof(ccv_nnc_tensor_param_t) * (output_size - 1));
+	cmd_exec_context->tuple.size = output_size;
+	cmd_exec_context->input_offset = input_offset;
+	cmd_exec_context->input_size = input_size;
+	cmd_exec_context->cmd = cmd;
+	cmd_exec_context->hint = hint;
+	cmd_exec_context->flags = flags;
+	memcpy(cmd_exec_context->output_params, output_params, sizeof(ccv_nnc_tensor_param_t) * output_size);
+	return ccv_cnnp_dataframe_map(dataframe, _ccv_cnnp_dataframe_cmd_exec, stream_type, _ccv_cnnp_tensor_list_deinit, COLUMN_ID_LIST(column_idx), cmd_exec_context, (ccv_cnnp_column_data_context_deinit_f)ccfree, name);
+	return 0;
+}
+
+// MARK - Make Auxiliary Tensor as a new Column
+
+static void _ccv_cnnp_tensor_deinit(void* const data, void* const context)
+{
+	ccv_nnc_tensor_free((ccv_nnc_tensor_t*)data);
+}
+
+static void _ccv_cnnp_tensor_new(const int column_idx, const int* const row_idxs, const int row_size, void** const data, void* const context, ccv_nnc_stream_context_t* const stream_context)
+{
+	ccv_nnc_tensor_param_t params = *(ccv_nnc_tensor_param_t*)context;
+	int i;
+	for (i = 0; i < row_size; i++)
+		if (!data[i])
+			data[i] = ccv_nnc_tensor_new(0, params, 0);
+}
+
+int ccv_cnnp_dataframe_add_aux(ccv_cnnp_dataframe_t* const dataframe, const ccv_nnc_tensor_param_t params, const char* name)
+{
+	int stream_type = CCV_TENSOR_GET_MEMORY(params.type) == CCV_TENSOR_CPU_MEMORY ? 0 : CCV_STREAM_CONTEXT_GPU;
+	if (stream_type == CCV_STREAM_CONTEXT_GPU)
+		CCV_STREAM_SET_DEVICE_ID(stream_type, CCV_TENSOR_GET_DEVICE_ID(params.type));
+	ccv_nnc_tensor_param_t* const context = (ccv_nnc_tensor_param_t*)ccmalloc(sizeof(ccv_nnc_tensor_param_t));
+	context[0] = params;
+	return ccv_cnnp_dataframe_add(dataframe, _ccv_cnnp_tensor_new, stream_type, _ccv_cnnp_tensor_deinit, context, (ccv_cnnp_column_data_context_deinit_f)ccfree, name);
+}
+
+// MARK - Load Tensor from File Path
+
+static void _ccv_cnnp_image_deinit(void* const data, void* const context)
+{
+	ccv_matrix_free(data);
+}
+
+static void _ccv_cnnp_read_image(void* const* const* const column_data, const int column_size, const int batch_size, void** const data, void* const context, ccv_nnc_stream_context_t* const stream_context)
+{
+	parallel_for(i, batch_size) {
+		if (data[i])
+			ccv_matrix_free(data[i]);
+		off_t structof = (off_t)context;
+		const char* const filename = *(char* const*)((const char*)column_data[0][i] + structof);
+		data[i] = 0;
+		ccv_read(filename, (ccv_dense_matrix_t**)&data[i], CCV_IO_ANY_FILE | CCV_IO_RGB_COLOR);
+	} parallel_endfor
+}
+
+int ccv_cnnp_dataframe_read_image(ccv_cnnp_dataframe_t* const dataframe, const int column_idx, const off_t structof, const char* name)
+{
+	return ccv_cnnp_dataframe_map(dataframe, _ccv_cnnp_read_image, 0, _ccv_cnnp_image_deinit, COLUMN_ID_LIST(column_idx), (void*)(uintptr_t)structof, 0, name);
+}
+
+// MARK - Apply Random Jitter to Image
+
+typedef struct {
+	sfmt_t sfmt;
+	int datatype;
+	ccv_cnnp_random_jitter_t random_jitter;
+} ccv_cnnp_random_jitter_context_t;
+
+static void _ccv_cnnp_image_lighting(ccv_dense_matrix_t* image, const float alpha_r, const float alpha_g, const float alpha_b)
+{
+	assert(CCV_GET_DATA_TYPE(image->type) == CCV_32F);
+	assert(CCV_GET_CHANNEL(image->type) == CCV_C3);
+	// These eigenvector values can be computed out of imageNet dataset (see ccv_convnet for how that is done). Here I just copied
+	// from mxnet: https://github.com/apache/incubator-mxnet/blob/master/src/operator/image/image_random-inl.h#L632
+	const float pca_r = alpha_r * (55.46 * -0.5675) + alpha_g * (4.794 * 0.7192) + alpha_b * (1.148 * 0.4009);
+	const float pca_g = alpha_r * (55.46 * -0.5808) + alpha_g * (4.794 * -0.0045) + alpha_b * (1.148 * -0.8140);
+	const float pca_b = alpha_r * (55.46 * -0.5836) + alpha_g * (4.794 * -0.6948) + alpha_b * (1.148 * 0.4203);
+	int i;
+	const int size = image->rows * image->cols;
+	float* const ptr = image->data.f32;
+	for (i = 0; i < size; i++)
+	{
+		ptr[i * 3] = ccv_clamp(ptr[i * 3] + pca_r, 0, 255);
+		ptr[i * 3 + 1] = ccv_clamp(ptr[i * 3 + 1] + pca_g, 0, 255);
+		ptr[i * 3 + 2] = ccv_clamp(ptr[i * 3 + 2] + pca_b, 0, 255);
+	}
+}
+
+static float _ccv_cnnp_random_logexp(sfmt_t* const sfmt, const float jitter)
+{
+	// We want to get something around logarithmic scale, thus, 0 is no good, and infinity is no good. 1 is the same.
+	// jitter is some turbulence we want around 1. We want the range range to be around [1 / (1 + jitter), 1 + jitter]
+	// but the distribution is not uniform (50% fall under 1, and 50% fall above 1). The way to do this is to first
+	// get to logarithmic range, doing a uniform sampling, and then convert back.
+	double log_jitter_limit = log(1 + jitter);
+	double log_random_jitter = sfmt_genrand_real1(sfmt) * 2 * log_jitter_limit - log_jitter_limit;
+	return (float)exp(log_random_jitter); // Convert it back to exponential form.
+}
+
+static void _ccv_cnnp_image_manip(ccv_dense_matrix_t* image, const ccv_cnnp_random_jitter_t random_jitter, sfmt_t* const sfmt)
+{
+	assert(sfmt && CCV_GET_CHANNEL(image->type) == CCV_C3);
+	int idx[4] = {0, 1, 2, 3};
+	sfmt_genrand_shuffle(sfmt, idx, 4, sizeof(int));
+	int i;
+	for (i = 0; i < 4; i++)
+		// change the applying order
+		switch (idx[i])
+		{
+			case 0:
+				if (random_jitter.brightness == 0)
+					break;
+				// introduce some brightness changes to the original image
+				ccv_scale(image, (ccv_matrix_t**)&image, 0, _ccv_cnnp_random_logexp(sfmt, random_jitter.brightness));
+				break;
+			case 1:
+				// introduce some saturation changes to the original image
+				if (random_jitter.saturation == 0)
+					break;
+				ccv_saturation(image, &image, 0, _ccv_cnnp_random_logexp(sfmt, random_jitter.saturation));
+				break;
+			case 2:
+				// introduce some contrast changes to the original image
+				if (random_jitter.contrast == 0)
+					break;
+				ccv_contrast(image, &image, 0, _ccv_cnnp_random_logexp(sfmt, random_jitter.contrast));
+				break;
+			case 3:
+				if (random_jitter.lighting == 0)
+					break;
+				_ccv_cnnp_image_lighting(image, sfmt_genrand_real1(sfmt) * random_jitter.lighting, sfmt_genrand_real1(sfmt) * random_jitter.lighting, sfmt_genrand_real1(sfmt) * random_jitter.lighting);
+				break;
+		}
+}
+
+static void _ccv_cnnp_normalize(ccv_dense_matrix_t* const image, const float mean[3], const float inv_std[3])
+{
+	int i;
+	const int count = image->rows * image->cols;
+	float* ap = image->data.f32;
+	for (i = 0; i < count; i++)
+	{
+		ap[i * 3] = (ap[i * 3] - mean[0]) * inv_std[0];
+		ap[i * 3 + 1] = (ap[i * 3 + 1] - mean[1]) * inv_std[1];
+		ap[i * 3 + 2] = (ap[i * 3 + 2] - mean[2]) * inv_std[2];
+	}
+}
+
+static void _ccv_cnnp_random_jitter(void* const* const* const column_data, const int column_size, const int batch_size, void** const data, void* const context, ccv_nnc_stream_context_t* const stream_context)
+{
+	sfmt_t* const sfmt = (sfmt_t*)ccmalloc(sizeof(sfmt_t) * batch_size);
+	ccv_cnnp_random_jitter_context_t* const ctx = (ccv_cnnp_random_jitter_context_t*)context;
+	int i;
+	for (i = 0; i < batch_size; i++)
+		sfmt_init_gen_rand(&sfmt[i], sfmt_genrand_uint32(&ctx->sfmt));
+	const ccv_cnnp_random_jitter_t random_jitter = ctx->random_jitter;
+	assert(random_jitter.resize.min > 0);
+	assert(random_jitter.resize.max >= random_jitter.resize.min);
+	parallel_for(i, batch_size) {
+		if (data[i])
+			ccv_matrix_free(data[i]);
+		ccv_dense_matrix_t* const input = (ccv_dense_matrix_t*)column_data[0][i];
+		const int resize = ccv_clamp((int)(sfmt_genrand_real1(&sfmt[i]) * (random_jitter.resize.max - random_jitter.resize.min) + 0.5) + random_jitter.resize.min, random_jitter.resize.min, random_jitter.resize.max);
+		int resize_rows = ccv_max(resize, (int)(input->rows * (float)resize / input->cols + 0.5));
+		int resize_cols = ccv_max(resize, (int)(input->cols * (float)resize / input->rows + 0.5));
+		if (random_jitter.aspect_ratio > 0)
+		{
+			const float aspect_ratio = sqrtf(_ccv_cnnp_random_logexp(&sfmt[i],  random_jitter.aspect_ratio));
+			resize_rows = (int)(resize_rows * aspect_ratio + 0.5);
+			resize_cols = (int)(resize_cols / aspect_ratio + 0.5);
+		}
+		if (random_jitter.resize.roundup > 0)
+		{
+			const int roundup = random_jitter.resize.roundup;
+			const int roundup_2 = roundup / 2;
+			resize_rows = (resize_rows + roundup_2) / roundup * roundup;
+			resize_cols = (resize_cols + roundup_2) / roundup * roundup;
+		}
+		const int need_crop = (random_jitter.size.cols > 0 && random_jitter.size.rows > 0 &&
+			((resize_cols != random_jitter.size.cols || resize_rows != random_jitter.size.rows) ||
+			 (random_jitter.offset.x != 0 || random_jitter.offset.y != 0)));
+		int cropped = 0, crop_x = 0, crop_y = 0;
+		ccv_dense_matrix_t* sliced = 0;
+		if (need_crop)
+		{
+			// Compute crop x, y.
+			crop_x = random_jitter.center_crop ?
+				(resize_cols - random_jitter.size.cols + 1) / 2 : // Otherwise, random select x.
+				(int)(sfmt_genrand_real1(&sfmt[i]) * (resize_cols - random_jitter.size.cols + 1));
+			crop_x = ccv_clamp(crop_x,
+				ccv_min(0, resize_cols - random_jitter.size.cols),
+				ccv_max(0, resize_cols - random_jitter.size.cols));
+			crop_y = random_jitter.center_crop ?
+				(resize_rows - random_jitter.size.rows + 1) / 2 : // Otherwise, random select y.
+				(int)(sfmt_genrand_real1(&sfmt[i]) * (resize_rows - random_jitter.size.rows + 1));
+			crop_y = ccv_clamp(crop_y,
+				ccv_min(0, resize_rows - random_jitter.size.rows),
+				ccv_max(0, resize_rows - random_jitter.size.rows));
+			if (random_jitter.offset.x != 0)
+				crop_x += sfmt_genrand_real1(&sfmt[i]) * random_jitter.offset.x * 2 - random_jitter.offset.x;
+			if (random_jitter.offset.y != 0)
+				crop_y += sfmt_genrand_real1(&sfmt[i]) * random_jitter.offset.y * 2 - random_jitter.offset.y;
+			// If we can fill in the whole view (not introducing any 0 padding), we can first crop and then scale down / up.
+			if (resize_cols >= random_jitter.size.cols && resize_rows >= random_jitter.size.rows)
+			{
+				const float scale_x = (float)input->cols / resize_cols;
+				const float scale_y = (float)input->rows / resize_rows;
+				const int slice_cols = (int)(random_jitter.size.cols * scale_x + 0.5);
+				const int slice_rows = (int)(random_jitter.size.rows * scale_y + 0.5);
+				assert(slice_cols <= input->cols);
+				assert(slice_rows <= input->rows);
+				const int x = ccv_clamp((int)(crop_x * scale_x + 0.5), 0, input->cols - slice_cols);
+				const int y = ccv_clamp((int)(crop_y * scale_y + 0.5), 0, input->rows - slice_rows);
+				ccv_slice(input, (ccv_matrix_t**)&sliced, 0, y, x, slice_rows, slice_cols);
+				resize_cols = random_jitter.size.cols;
+				resize_rows = random_jitter.size.rows;
+				cropped = 1;
+			} else
+				sliced = input;
+		} else
+			sliced = input;
+		ccv_dense_matrix_t* resized = 0;
+		// Resize.
+		if (sliced->rows >= resize_rows && sliced->cols >= resize_cols)
+		{
+			// If we can fill in the whole view, we can first crop and then scale down / up.
+			ccv_resample(sliced, &resized, CCV_32F, (double)resize_rows / (double)sliced->rows, (double)resize_cols / (double)sliced->cols, CCV_INTER_AREA);
+		} else if (sliced->rows != resize_rows || sliced->cols != resize_cols) {
+			ccv_resample(sliced, &resized, CCV_32F, (double)resize_rows / (double)sliced->rows, (double)resize_cols / (double)sliced->cols, CCV_INTER_CUBIC);
+		} else {
+			ccv_shift(sliced, (ccv_matrix_t**)&resized, CCV_32F, 0, 0); // converting to 32f
+		}
+		if (sliced != input)
+			ccv_matrix_free(sliced);
+		if (random_jitter.symmetric && (sfmt_genrand_uint32(&sfmt[i]) & 1) == 0)
+			ccv_flip(resized, &resized, 0, CCV_FLIP_X);
+		_ccv_cnnp_image_manip(resized, random_jitter, &sfmt[i]);
+		// Apply normalization. Slice will introduce 0 padding, which won't be correct before normalization.
+		if (random_jitter.normalize.mean[0] != 0 || random_jitter.normalize.std[0] != 1 ||
+			random_jitter.normalize.mean[1] != 0 || random_jitter.normalize.std[1] != 1 ||
+			random_jitter.normalize.mean[2] != 0 || random_jitter.normalize.std[2] != 1)
+			_ccv_cnnp_normalize(resized, random_jitter.normalize.mean, random_jitter.normalize.std);
+		// If we haven't cropped in previous step (likely because we have some fill-ins due to the resize down too much).
+		// Do the crop now.
+		ccv_dense_matrix_t* patch = 0;
+		if (!cropped && need_crop)
+		{
+			ccv_slice(resized, (ccv_matrix_t**)&patch, CCV_32F, crop_y, crop_x, random_jitter.size.rows, random_jitter.size.cols);
+			ccv_matrix_free(resized);
+		} else
+			patch = resized;
+		assert(!ccv_any_nan(patch));
+		data[i] = patch;
+	} parallel_endfor
+	ccfree(sfmt);
+}
+
+int ccv_cnnp_dataframe_image_random_jitter(ccv_cnnp_dataframe_t* const dataframe, const int column_idx, const int datatype, const ccv_cnnp_random_jitter_t random_jitter, const char* name)
+{
+	assert(datatype == CCV_32F);
+	ccv_cnnp_random_jitter_context_t* const random_jitter_context = (ccv_cnnp_random_jitter_context_t*)ccmalloc(sizeof(ccv_cnnp_random_jitter_context_t));
+	if (random_jitter.seed)
+		sfmt_init_gen_rand(&random_jitter_context->sfmt, (uint32_t)random_jitter.seed);
+	else
+		sfmt_init_gen_rand(&random_jitter_context->sfmt, ccv_nnc_stream_context_genrand_uint32(0));
+	random_jitter_context->datatype = datatype;
+	random_jitter_context->random_jitter = random_jitter;
+	int i;
+	// The std in the random jitter should be inv_std.
+	for (i = 0; i < 3; i++)
+		random_jitter_context->random_jitter.normalize.std[i] = random_jitter_context->random_jitter.normalize.std[i] ? 1. / random_jitter_context->random_jitter.normalize.std[i] : 1;
+	return ccv_cnnp_dataframe_map(dataframe, _ccv_cnnp_random_jitter, 0, _ccv_cnnp_image_deinit, COLUMN_ID_LIST(column_idx), random_jitter_context, (ccv_cnnp_column_data_context_deinit_f)ccfree, name);
+}
+
+typedef struct {
+	int range;
+	int datatype;
+	int format;
+	float onval;
+	float offval;
+	off_t structof;
+} ccv_cnnp_one_hot_context_t;
+
+static void _ccv_cnnp_one_hot(void* const* const* const column_data, const int column_size, const int batch_size, void** const data, void* const context, ccv_nnc_stream_context_t* const stream_context)
+{
+	ccv_cnnp_one_hot_context_t* const one_hot = (ccv_cnnp_one_hot_context_t*)context;
+	ccv_nnc_tensor_param_t params = {
+		.datatype = one_hot->datatype,
+		.type = CCV_TENSOR_CPU_MEMORY,
+		.format = one_hot->format,
+		.dim = {
+			one_hot->range,
+		},
+	};
+	parallel_for(i, batch_size) {
+		int j;
+		const int label = *(const int*)((const char*)column_data[0][i] + one_hot->structof);
+		if (!data[i])
+			data[i] = ccv_nnc_tensor_new(0, params, 0);
+		ccv_nnc_tensor_t* const tensor = (ccv_nnc_tensor_t*)data[i];
+		assert(label >= 0 && label < one_hot->range);
+		if (tensor->info.datatype == CCV_32F)
+			for (j = 0; j < one_hot->range; j++)
+				tensor->data.f32[j] = (j == label) ? one_hot->onval : one_hot->offval;
+		else if (tensor->info.datatype == CCV_16F)
+			for (j = 0; j < one_hot->range; j++)
+				ccv_float_to_half_precision((j == label) ? &one_hot->onval : &one_hot->offval, (uint16_t*)(tensor->data.f16 + j), 1);
+		else
+			{ assert(0); }
+	} parallel_endfor
+}
+
+int ccv_cnnp_dataframe_one_hot(ccv_cnnp_dataframe_t* const dataframe, const int column_idx, const off_t structof, const int range, const float onval, const float offval, const int datatype, const int format, const char* name)
+{
+	assert(datatype == CCV_32F || datatype == CCV_16F);
+	ccv_cnnp_one_hot_context_t* const one_hot = (ccv_cnnp_one_hot_context_t*)ccmalloc(sizeof(ccv_cnnp_one_hot_context_t));
+	one_hot->range = range;
+	one_hot->datatype = datatype;
+	one_hot->format = format;
+	one_hot->onval = onval;
+	one_hot->offval = offval;
+	one_hot->structof = structof;
+	return ccv_cnnp_dataframe_map(dataframe, _ccv_cnnp_one_hot, 0, _ccv_cnnp_tensor_deinit, COLUMN_ID_LIST(column_idx), one_hot, (ccv_cnnp_column_data_context_deinit_f)ccfree, name);
+}
+
+typedef struct {
+	int from_dt;
+	int to_dt;
+	int format;
+	off_t structof;
+} ccv_cnnp_copy_scalar_context_t;
+
+static void _ccv_cnnp_copy_scalar(void* const* const* const column_data, const int column_size, const int batch_size, void** const data, void* const context, ccv_nnc_stream_context_t* const stream_context)
+{
+	ccv_cnnp_copy_scalar_context_t* const copy_scalar = (ccv_cnnp_copy_scalar_context_t*)context;
+	ccv_nnc_tensor_param_t params = {
+		.datatype = copy_scalar->to_dt,
+		.type = CCV_TENSOR_CPU_MEMORY,
+		.format = copy_scalar->format,
+		.dim = {1},
+	};
+	parallel_for(i, batch_size) {
+		const ccv_numeric_data_t value = {
+			.u8 = (unsigned char *)((const char*)column_data[0][i] + copy_scalar->structof),
+		};
+		if (!data[i])
+			data[i] = ccv_nnc_tensor_new(0, params, 0);
+		ccv_nnc_tensor_t* const tensor = (ccv_nnc_tensor_t*)data[i];
+		if (copy_scalar->from_dt == CCV_32S)
+		{
+			if (tensor->info.datatype == CCV_32F)
+				tensor->data.f32[0] = value.i32[0];
+			else if (tensor->info.datatype == CCV_16F) {
+				float fval = value.i32[0];
+				ccv_float_to_half_precision(&fval, (uint16_t*)tensor->data.f16, 1);
+			}
+		} else if (copy_scalar->from_dt == CCV_32F) {
+			if (tensor->info.datatype == CCV_32F)
+				tensor->data.f32[0] = value.f32[0];
+			else if (tensor->info.datatype == CCV_16F)
+				ccv_float_to_half_precision(value.f32, (uint16_t*)tensor->data.f16, 1);
+		} else if (copy_scalar->from_dt == CCV_16F) {
+			if (tensor->info.datatype == CCV_32F)
+				ccv_half_precision_to_float((uint16_t*)value.f16, tensor->data.f32, 1);
+			else if (tensor->info.datatype == CCV_16F)
+				tensor->data.f16[0] = value.f16[0];
+		}
+	} parallel_endfor
+}
+
+CCV_WARN_UNUSED(int) ccv_cnnp_dataframe_copy_scalar(ccv_cnnp_dataframe_t* const dataframe, const int column_idx, const off_t structof, const int from_dt, const int to_dt, const int format, const char* name)
+{
+	assert(from_dt == CCV_32S || from_dt == CCV_32F || from_dt == CCV_16F);
+	assert(to_dt == CCV_32F || to_dt == CCV_16F);
+	ccv_cnnp_copy_scalar_context_t* const copy_scalar = (ccv_cnnp_copy_scalar_context_t*)ccmalloc(sizeof(ccv_cnnp_copy_scalar_context_t));
+	copy_scalar->from_dt = from_dt;
+	copy_scalar->to_dt = to_dt;
+	copy_scalar->format = format;
+	copy_scalar->structof = structof;
+	return ccv_cnnp_dataframe_map(dataframe, _ccv_cnnp_copy_scalar, 0, _ccv_cnnp_tensor_deinit, COLUMN_ID_LIST(column_idx), copy_scalar, (ccv_cnnp_column_data_context_deinit_f)ccfree, name);
+}
+
+// MARK - Matrix of Ones
+
+typedef struct {
+	ccv_cnnp_dataframe_tuple_t tuple;
+	int variable_size;
+	int max_length;
+} ccv_cnnp_one_squared_context_t;
+
+static void _ccv_cnnp_one_squared(void* const* const* const column_data, const int column_size, const int batch_size, void** const data, void* const context, ccv_nnc_stream_context_t* const stream_context)
+{
+	ccv_cnnp_one_squared_context_t* const ones = (ccv_cnnp_one_squared_context_t*)context;
+	assert(ones->tuple.size == column_size);
+	const int max_length = ones->max_length;
+	if (ones->variable_size)
+	{
+		parallel_for(i, batch_size) {
+			ccv_nnc_tensor_t* const first_seq = (ccv_nnc_tensor_t*)column_data[0][i];
+			assert(first_seq->info.datatype == CCV_32S);
+			const int first_len = ccv_nnc_tensor_count(first_seq->info);
+			ccv_nnc_tensor_t** outputs = data[i];
+			if (!outputs)
+				outputs = (ccv_nnc_tensor_t**)(data[i] = cccalloc(column_size, sizeof(ccv_nnc_tensor_t*)));
+			int k;
+			for (k = 0; k < column_size; k++)
+				if (!outputs[k])
+					outputs[k] = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32S, first_len, max_length, max_length), 0);
+			int max_len = 0;
+			for (k = 0; k < column_size; k++)
+			{
+				ccv_nnc_tensor_t* const seq = (ccv_nnc_tensor_t*)column_data[k][i];
+				assert(seq->info.datatype == CCV_32S);
+				const int len = ccv_nnc_tensor_count(seq->info);
+				assert(len == first_len);
+				const int* const ia = seq->data.i32;
+				int l;
+				for (l = 0; l < len; l++)
+					max_len = ccv_max(max_len, ia[l]);
+			}
+			assert(max_len <= max_length);
+			parallel_for(c, column_size) {
+				ccv_nnc_tensor_t* const seq = (ccv_nnc_tensor_t*)column_data[c][i];
+				assert(seq->info.datatype == CCV_32S);
+				const int len = ccv_nnc_tensor_count(seq->info);
+				assert(len == first_len);
+				ccv_nnc_tensor_t* tensor = outputs[c];
+				tensor = ccv_nnc_tensor_resize(tensor, CPU_TENSOR_NHWC(32S, len, max_len, max_len));
+				assert(outputs[c] == tensor); // Since we allocated with max_length, this cannot be reallocated.
+				const int* const ia = seq->data.i32;
+				parallel_for(j, len) {
+					int x, y;
+					int seq_len = ia[j];
+					int* ib = tensor->data.i32 + j * max_len * max_len;
+					for (y = 0; y < seq_len; y++)
+					{
+						for (x = 0; x < seq_len; x++)
+							ib[x] = 1;
+						for (x = seq_len; x < max_len; x++)
+							ib[x] = 0;
+						ib += max_len;
+					}
+					if (seq_len < max_len)
+						memset(ib, 0, sizeof(int) * max_len * (max_len - seq_len));
+				} parallel_endfor
+			} parallel_endfor
+		} parallel_endfor
+	} else {
+		parallel_for(i, batch_size) {
+			ccv_nnc_tensor_t** outputs = data[i];
+			ccv_nnc_tensor_t* const first_seq = (ccv_nnc_tensor_t*)column_data[0][i];
+			assert(first_seq->info.datatype == CCV_32S);
+			const int first_len = ccv_nnc_tensor_count(first_seq->info);
+			if (!outputs)
+				outputs = (ccv_nnc_tensor_t**)(data[i] = cccalloc(column_size, sizeof(ccv_nnc_tensor_t*)));
+			int k;
+			for (k = 0; k < column_size; k++)
+				if (!outputs[k])
+					outputs[k] = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32S, first_len, max_length, max_length), 0);
+			parallel_for(c, column_size) {
+				ccv_nnc_tensor_t* const tensor = outputs[c];
+				ccv_nnc_tensor_t* const seq = (ccv_nnc_tensor_t*)column_data[c][i];
+				assert(seq->info.datatype == CCV_32S);
+				const int len = ccv_nnc_tensor_count(seq->info);
+				assert(len == first_len);
+				const int* const ia = seq->data.i32;
+				parallel_for(j, len) {
+					int x, y;
+					int seq_len = ia[j];
+					int* ib = tensor->data.i32 + j * max_length * max_length;
+					for (y = 0; y < seq_len; y++)
+					{
+						for (x = 0; x < seq_len; x++)
+							ib[x] = 1;
+						for (x = seq_len; x < max_length; x++)
+							ib[x] = 0;
+						ib += max_length;
+					}
+					if (seq_len < max_length)
+						memset(ib, 0, sizeof(int) * max_length * (max_length - seq_len));
+				} parallel_endfor
+			} parallel_endfor
+		} parallel_endfor
+	}
+}
+
+CCV_WARN_UNUSED(int) ccv_cnnp_dataframe_one_squared(ccv_cnnp_dataframe_t* const dataframe,  const int* const column_idxs, const int column_idx_size, const int variable_size, const int max_length, const char* name)
+{
+	assert(max_length > 0);
+	assert(variable_size == 0 || variable_size == 1);
+	ccv_cnnp_one_squared_context_t* const ones = (ccv_cnnp_one_squared_context_t*)ccmalloc(sizeof(ccv_cnnp_one_squared_context_t));
+	ones->tuple.size = column_idx_size;
+	ones->variable_size = variable_size;
+	ones->max_length = max_length;
+	return ccv_cnnp_dataframe_map(dataframe, _ccv_cnnp_one_squared, 0, _ccv_cnnp_tensor_list_deinit, column_idxs, column_idx_size, ones, (ccv_cnnp_column_data_context_deinit_f)ccfree, name);
+}
+
+// MARK - Truncate Matrix
+
+static void _ccv_cnnp_truncate(void* const* const* const column_data, const int column_size, const int batch_size, void** const data, void* const context, ccv_nnc_stream_context_t* const stream_context)
+{
+	assert(column_size >= 2);
+	assert(column_size % 2 == 0);
+	const int tuple_size = column_size / 2;
+	ccv_cnnp_dataframe_tuple_t* const tuple = (ccv_cnnp_dataframe_tuple_t*)context;
+	assert(tuple->size == tuple_size);
+	parallel_for(i, batch_size) {
+		int k;
+		ccv_nnc_tensor_t* const first_seq = (ccv_nnc_tensor_t*)column_data[tuple_size][i];
+		assert(first_seq->info.datatype == CCV_32S);
+		const int first_len = ccv_nnc_tensor_count(first_seq->info);
+		int max_len = 0;
+		for (k = 0; k < tuple_size; k++)
+		{
+			ccv_nnc_tensor_t* const seq = (ccv_nnc_tensor_t*)column_data[tuple_size + k][i];
+			assert(seq->info.datatype == CCV_32S);
+			const int len = ccv_nnc_tensor_count(seq->info);
+			assert(len == first_len);
+			const int* const ia = seq->data.i32;
+			int l;
+			for (l = 0; l < len; l++)
+				max_len = ccv_max(max_len, ia[l]);
+		}
+		ccv_nnc_tensor_t* const first_inp = (ccv_nnc_tensor_t*)column_data[0][i];
+		ccv_nnc_tensor_param_t first_params = first_inp->info;
+		assert(first_params.dim[0] == first_len);
+		assert(max_len <= first_params.dim[1]);
+		first_params.dim[1] = max_len;
+		ccv_nnc_tensor_t** outputs = data[i];
+		if (!outputs)
+			outputs = (ccv_nnc_tensor_t**)(data[i] = cccalloc(tuple_size, sizeof(ccv_nnc_tensor_t*)));
+		for (k = 0; k < tuple_size; k++)
+		{
+			if (!outputs[k])
+				outputs[k] = ccv_nnc_tensor_new(0, first_params, 0);
+			else
+				outputs[k] = ccv_nnc_tensor_resize(outputs[k], first_params);
+		}
+		parallel_for(c, tuple_size) {
+			ccv_nnc_tensor_t* const seq = (ccv_nnc_tensor_t*)column_data[tuple_size + c][i];
+			assert(seq->info.datatype == CCV_32S);
+			const int len = ccv_nnc_tensor_count(seq->info);
+			ccv_nnc_tensor_t* const inp = (ccv_nnc_tensor_t*)column_data[c][i];
+			ccv_nnc_tensor_param_t params = inp->info;
+			assert(params.dim[0] == len);
+			assert(first_len == len);
+			assert(max_len <= params.dim[1]);
+			assert(params.dim[2] == 0);
+			const int ori_len = params.dim[1];
+			ccv_nnc_tensor_t* const out = outputs[c];
+			uint8_t* const ua = inp->data.u8;
+			uint8_t* const ub = out->data.u8;
+			size_t la = CCV_GET_DATA_TYPE_SIZE(params.datatype) * ori_len;
+			size_t lb = CCV_GET_DATA_TYPE_SIZE(params.datatype) * max_len;
+			parallel_for(j, len) {
+				memcpy(ub + lb * j, ua + la * j, lb);
+			} parallel_endfor
+		} parallel_endfor
+	} parallel_endfor
+}
+
+int ccv_cnnp_dataframe_truncate(ccv_cnnp_dataframe_t* const dataframe, const int* const vec_idxs, const int vec_idx_size, const int* const len_idxs, const int len_idx_size, const char* name)
+{
+	const int total_idx_size = vec_idx_size + len_idx_size;
+	assert(total_idx_size > 0);
+	assert(vec_idx_size == len_idx_size);
+	int total_idxs[total_idx_size];
+	memcpy(total_idxs, vec_idxs, sizeof(int) * vec_idx_size);
+	memcpy(total_idxs + vec_idx_size, len_idxs, sizeof(int) * len_idx_size);
+	ccv_cnnp_dataframe_tuple_t* const tuple =  (ccv_cnnp_dataframe_tuple_t*)ccmalloc(sizeof(ccv_cnnp_dataframe_tuple_t));
+	tuple->size = vec_idx_size;
+	return ccv_cnnp_dataframe_map(dataframe, _ccv_cnnp_truncate, 0, _ccv_cnnp_tensor_list_deinit, total_idxs, total_idx_size, tuple, (ccv_cnnp_column_data_context_deinit_f)ccfree, name);
+}
+
+// MARK - Batching
+
+typedef struct {
+	ccv_cnnp_dataframe_tuple_t tuple;
+	int format;
+	int batch_count;
+	int group_count;
+} ccv_cnnp_batch_context_t;
+
+static void _ccv_cnnp_combine_new(void* const* const input_data, const int input_size, void** const output_data, void* const context, ccv_nnc_stream_context_t* const stream_context)
+{
+	ccv_cnnp_batch_context_t* const batch = (ccv_cnnp_batch_context_t*)context;
+	const int output_tuple_size = batch->tuple.size;
+	const int batch_count = batch->batch_count;
+	const int group_count = batch->group_count;
+	const int input_tuple_size = output_tuple_size / group_count;
+	int i, j, k;
+	assert(input_size > 0);
+	if (!output_data[0])
+	{
+		ccv_nnc_tensor_t** const inputs = (ccv_nnc_tensor_t**)input_data[0];
+		ccv_nnc_tensor_t** const tensors = (ccv_nnc_tensor_t**)(output_data[0] = ccmalloc(sizeof(ccv_nnc_tensor_t*) * output_tuple_size));
+		for (i = 0; i < group_count; i++)
+			for (j = 0; j < input_tuple_size; j++)
+			{
+				ccv_nnc_tensor_param_t params = inputs[j]->info;
+				assert(params.datatype == CCV_32F || params.datatype == CCV_32S || params.datatype == CCV_16F); // Only support 32 bit float yet.
+				assert(params.format == CCV_TENSOR_FORMAT_NHWC || params.format == CCV_TENSOR_FORMAT_NCHW);
+				params.format = batch->format;
+				// Special-case for dim count is 3 and 1, in these two cases, the N is not provided.
+				if (batch->format == inputs[j]->info.format)
+				{
+					const int nd = ccv_nnc_tensor_nd(params.dim);
+					memset(params.dim, 0, sizeof(int) * CCV_NNC_MAX_DIM_ALLOC);
+					memcpy(params.dim + 1, inputs[j]->info.dim, sizeof(int) * nd);
+				} else {
+					const int nd = ccv_nnc_tensor_nd(params.dim);
+					if (nd < 3)
+					{
+						memset(params.dim, 0, sizeof(int) * CCV_NNC_MAX_DIM_ALLOC);
+						memcpy(params.dim + 1, inputs[j]->info.dim, sizeof(int) * nd);
+					} else if (nd >= 3) {
+						memset(params.dim, 0, sizeof(int) * CCV_NNC_MAX_DIM_ALLOC);
+						const int hw = ccv_nnc_tensor_hw(inputs[j]->info, nd, CCV_NNC_MAX_DIM);
+						if (batch->format == CCV_TENSOR_FORMAT_NCHW)
+						{
+							params.dim[1] = ccv_nnc_tensor_get_c(inputs[j]->info);
+							for (k = 0; k < CCV_NNC_MAX_DIM; k++)
+								params.dim[k + 2] = inputs[j]->info.dim[k + hw];
+						} else {
+							params.dim[CCV_NNC_MAX_DIM + 1] = ccv_nnc_tensor_get_c(inputs[j]->info);
+							for (k = 0; k < CCV_NNC_MAX_DIM; k++)
+								params.dim[k + 1] = inputs[j]->info.dim[k + hw];
+						}
+					}
+				}
+				params.dim[0] = batch_count; // Set the batch count now.
+				tensors[i * input_tuple_size + j] = ccv_nnc_tensor_new(0, params, 0);
+			}
+	}
+	for (i = 0; i < group_count; i++)
+		for (j = 0; j < input_tuple_size; j++)
+		{
+			ccv_nnc_tensor_t* const output = ((ccv_nnc_tensor_t**)output_data[0])[i * input_tuple_size + j];
+			parallel_for(k, batch_count) {
+				ccv_nnc_tensor_t* const input = ((ccv_nnc_tensor_t**)input_data[(k + i * batch_count) % input_size])[j];
+				const size_t tensor_count = ccv_nnc_tensor_count(input->info);
+				if (input->info.datatype == CCV_32F)
+				{
+					float* const ap = input->data.f32;
+					float* const bp = output->data.f32 + k * tensor_count;
+					if (input->info.format == output->info.format)
+						memcpy(bp, ap, sizeof(float) * tensor_count);
+					else {
+						// Do a simple format conversion.
+						const int c = ccv_nnc_tensor_get_c(input->info);
+						assert(c > 0);
+						const size_t hw_count = tensor_count / c;
+						size_t x;
+						int y;
+						if (input->info.format == CCV_TENSOR_FORMAT_NHWC && output->info.format == CCV_TENSOR_FORMAT_NCHW)
+							for (x = 0; x < hw_count; x++)
+								for (y = 0; y < c; y++)
+									bp[y * hw_count + x] = ap[x * c + y];
+						else if (input->info.format == CCV_TENSOR_FORMAT_NCHW && output->info.format == CCV_TENSOR_FORMAT_NHWC)
+							for (x = 0; x < hw_count; x++)
+								for (y = 0; y < c; y++)
+									bp[x * c + y] = ap[y * hw_count + x];
+					}
+				} else if (input->info.datatype == CCV_32S) {
+					int* const ap = input->data.i32;
+					int* const bp = output->data.i32 + k * tensor_count;
+					if (input->info.format == output->info.format)
+						memcpy(bp, ap, sizeof(int) * tensor_count);
+					else {
+						// Do a simple format conversion.
+						const int c = ccv_nnc_tensor_get_c(input->info);
+						assert(c > 0);
+						const size_t hw_count = tensor_count / c;
+						size_t x;
+						int y;
+						if (input->info.format == CCV_TENSOR_FORMAT_NHWC && output->info.format == CCV_TENSOR_FORMAT_NCHW)
+							for (x = 0; x < hw_count; x++)
+								for (y = 0; y < c; y++)
+									bp[y * hw_count + x] = ap[x * c + y];
+						else if (input->info.format == CCV_TENSOR_FORMAT_NCHW && output->info.format == CCV_TENSOR_FORMAT_NHWC)
+							for (x = 0; x < hw_count; x++)
+								for (y = 0; y < c; y++)
+									bp[x * c + y] = ap[y * hw_count + x];
+					}
+				} else if (input->info.datatype == CCV_16F) {
+					ccv_float16_t* const ap = input->data.f16;
+					ccv_float16_t* const bp = output->data.f16 + k * tensor_count;
+					if (input->info.format == output->info.format)
+						memcpy(bp, ap, sizeof(ccv_float16_t) * tensor_count);
+					else {
+						// Do a simple format conversion.
+						const int c = ccv_nnc_tensor_get_c(input->info);
+						assert(c > 0);
+						const size_t hw_count = tensor_count / c;
+						size_t x;
+						int y;
+						if (input->info.format == CCV_TENSOR_FORMAT_NHWC && output->info.format == CCV_TENSOR_FORMAT_NCHW)
+							for (x = 0; x < hw_count; x++)
+								for (y = 0; y < c; y++)
+									bp[y * hw_count + x] = ap[x * c + y];
+						else if (input->info.format == CCV_TENSOR_FORMAT_NCHW && output->info.format == CCV_TENSOR_FORMAT_NHWC)
+							for (x = 0; x < hw_count; x++)
+								for (y = 0; y < c; y++)
+									bp[x * c + y] = ap[y * hw_count + x];
+					}
+				} else {
+					assert(0);
+				}
+			} parallel_endfor
+		}
+}
+
+static void _ccv_cnnp_combine_deinit(void* const self, void* const context)
+{
+	ccv_cnnp_batch_context_t* const batch = (ccv_cnnp_batch_context_t*)context;
+	ccv_nnc_tensor_t** const tensors = (ccv_nnc_tensor_t**)self;
+	const int size = batch->tuple.size;
+	int i;
+	for (i = 0; i < size; i++)
+		ccv_nnc_tensor_free(tensors[i]);
+	ccfree(tensors);
+}
+
+ccv_cnnp_dataframe_t* ccv_cnnp_dataframe_combine_new(ccv_cnnp_dataframe_t* const dataframe, const int* const column_idxs, const int column_idx_size, const int batch_count, const int group_count, const int format)
+{
+	assert(format == CCV_TENSOR_FORMAT_NCHW || format == CCV_TENSOR_FORMAT_NHWC);
+	assert(column_idx_size >= 1);
+	assert(batch_count > 0);
+	assert(group_count > 0);
+	const int derived = ccv_cnnp_dataframe_make_tuple(dataframe, column_idxs, column_idx_size, 0);
+	ccv_cnnp_batch_context_t* const batch = (ccv_cnnp_batch_context_t*)ccmalloc(sizeof(ccv_cnnp_batch_context_t));
+	batch->tuple.size = column_idx_size * group_count;
+	batch->format = format;
+	batch->batch_count = batch_count;
+	batch->group_count = group_count;
+	return ccv_cnnp_dataframe_sample_new(dataframe, _ccv_cnnp_combine_new, _ccv_cnnp_combine_deinit, derived, batch_count * group_count, batch, (ccv_cnnp_column_data_context_deinit_f)ccfree);
+}

@@ -1,0 +1,114 @@
+#include "GemvDescriptor.hpp"
+#include "GemvKernel.hpp"
+#include "../ccv_nnc_mfa_hash.hpp"
+#include "../ccv_nnc_mfa_error.hpp"
+
+#include <algorithm>
+#include <cstring>
+
+bool GemvDescriptor::operator==(const GemvDescriptor& rhs) const {
+  return
+  fusedBias == rhs.fusedBias &&
+  mrows == rhs.mrows &&
+  cooperative == rhs.cooperative &&
+  memoryPrecision == rhs.memoryPrecision &&
+  nrows == rhs.nrows &&
+  ncols == rhs.ncols &&
+  batchStrides.has_value() == rhs.batchStrides.has_value() &&
+  simd_all(batchStrides.value_or(simd::uint3(UINT32_MAX)) == rhs.batchStrides.value_or(simd::uint3(UINT32_MAX)));
+}
+
+uint32_t GemvDescriptor::rowsPerThreadgroup(MTL::Device* const device) noexcept {
+  uint32_t rows = 4;
+  const char* const deviceName = device->name()->utf8String();
+  if (deviceName && (strstr(deviceName, "M1") != 0 ||
+      strstr(deviceName, "M2") != 0 ||
+      strstr(deviceName, "M3") != 0 ||
+      strstr(deviceName, "M4") != 0 ||
+      strstr(deviceName, "M5") != 0)) {
+    if (strstr(deviceName, "Max") != 0 ||
+        strstr(deviceName, "Ultra") != 0) {
+      rows = 8;
+    } else if (strstr(deviceName, "Pro") != 0) {
+      rows = 4;
+    }
+  }
+  return rows;
+}
+
+uint32_t GemvDescriptor::cooperativeSIMDGroups(MTL::Device* const device, const uint32_t ncols) noexcept {
+  const uint32_t simdGroups = ncols >= 3072 ? 32 : ncols >= 1536 ? 16 : 8;
+  const uint32_t maxSIMDGroups = (uint32_t)device->maxThreadsPerThreadgroup().width / 32;
+  return std::max<uint32_t>(1, std::min(simdGroups, maxSIMDGroups));
+}
+
+std::size_t std::hash<GemvDescriptor>::operator()(const GemvDescriptor& hash) const noexcept {
+  using namespace ccv::nnc::mfa::hash;
+  std::size_t seed = 0;
+  seed = combine_64(seed, pack_64(simd::uint2 { (unsigned int)hash.memoryPrecision.value, (unsigned int)hash.fusedBias | ((unsigned int)hash.mrows << 8) | ((unsigned int)hash.cooperative << 16) }));
+  seed = combine_64(seed, pack_64(simd::uint2 { (unsigned int)hash.nrows, (unsigned int)hash.ncols }));
+  if (hash.batchStrides.has_value()) {
+    seed = combine_32(seed, hash.batchStrides.value()[0]);
+    seed = combine_32(seed, hash.batchStrides.value()[1]);
+    seed = combine_32(seed, hash.batchStrides.value()[2]);
+  }
+  return seed;
+}
+
+std::pair<GemvKernelDescriptor, PipelineValue<GemvKernel>*> GemvDescriptor::findKernel(MTL::Device* const device, const DeviceProperties& dprops, NS::Array* const binaryArchivesToRead, MTL::BinaryArchive* const binaryArchiveToWrite, const std::string& pathToWrite, std::unordered_map<GemvKernelDescriptor, std::unique_ptr<GemvKernel>> *const libraryCache) const noexcept {
+  auto createKernel =
+  [=](GemvKernelDescriptor descriptor) -> GemvKernel* {
+    auto iterator = libraryCache->find(descriptor);
+    if (iterator != libraryCache->end()) {
+      return iterator->second.get();
+    } else {
+      GemvKernel* kernel = new GemvKernel(descriptor, device);
+      (*libraryCache)[descriptor] = std::unique_ptr<GemvKernel>(kernel);
+      return kernel;
+    }
+  };
+
+  GemvKernelDescriptor kernelDesc;
+  kernelDesc.fusedBias = fusedBias;
+  kernelDesc.mrows = mrows;
+  kernelDesc.batched = batchStrides.has_value();
+  kernelDesc.cooperative = cooperative;
+  kernelDesc.memoryPrecision = memoryPrecision;
+
+  auto createPipeline =
+  [=](MTL::Library* library) -> MTL::ComputePipelineState* {
+    auto constants = NS::TransferPtr
+    (MTL::FunctionConstantValues::alloc()->init());
+    const uint32_t rows = rowsPerThreadgroup(device);
+    constants->setConstantValue(&rows, MTL::DataTypeUInt, NS::UInteger(0));
+    constants->setConstantValue(&ncols, MTL::DataTypeUInt, NS::UInteger(1));
+    constants->setConstantValue(&nrows, MTL::DataTypeUInt, NS::UInteger(2));
+    if (cooperative) {
+      const uint32_t simdGroups = cooperativeSIMDGroups(device, ncols);
+      constants->setConstantValue(&simdGroups, MTL::DataTypeUInt, NS::UInteger(3));
+    } else if (batchStrides.has_value()) {
+      const uint32_t batchStrideA = batchStrides.value()[0];
+      const uint32_t batchStrideB = batchStrides.value()[1];
+      const uint32_t batchStrideC = batchStrides.value()[2];
+      constants->setConstantValue(&batchStrideA, MTL::DataTypeUInt, NS::UInteger(3));
+      constants->setConstantValue(&batchStrideB, MTL::DataTypeUInt, NS::UInteger(4));
+      constants->setConstantValue(&batchStrideC, MTL::DataTypeUInt, NS::UInteger(5));
+    }
+
+    NS::String* swiftName = NS::String::string("gemv", NS::UTF8StringEncoding);
+    NS::Error* error = nil;
+
+    auto function = NS::TransferPtr
+    (library->newFunction(swiftName, constants.get(), &error));
+    CCV_NNC_MFA_CHECK_ERROR(error);
+
+    auto pipeline = device->newComputePipelineState(function.get(), &error);
+    CCV_NNC_MFA_CHECK_ERROR(error);
+    return pipeline;
+  };
+  GemvKernel* kernel = createKernel(kernelDesc);
+  auto pipeline = NS::TransferPtr(createPipeline(kernel->library.get()));
+
+  PipelineValue<GemvKernel>* output = new PipelineValue<GemvKernel> { kernel, pipeline };
+  return std::make_pair(kernelDesc, output);
+}

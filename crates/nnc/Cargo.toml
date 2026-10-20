@@ -1,0 +1,15 @@
+[package]
+name = "nnc"
+description = "Safe Rust interface to the nnc neural network library (dynamic graph, tensors, ops)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nnc-sys = { path = "../nnc-sys" }
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
+thiserror = "2"
+
+[dev-dependencies]
+approx = "0.5"

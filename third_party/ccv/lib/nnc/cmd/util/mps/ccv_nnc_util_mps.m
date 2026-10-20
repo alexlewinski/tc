@@ -1,0 +1,723 @@
+#include <ccv.h>
+#include <ccv_internal.h>
+#include <nnc/ccv_nnc.h>
+#include <nnc/ccv_nnc_easy.h>
+#include <nnc/ccv_nnc_internal.h>
+#include <nnc/mps/ccv_nnc_mps.h>
+#import <mach/vm_page_size.h>
+
+static int _ccv_nnc_data_transfer(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint, const int flags, ccv_nnc_tensor_t* const* const inputs, const int input_size, ccv_nnc_tensor_t* const* const outputs, const int output_size, ccv_nnc_stream_context_t* const stream_context)
+{
+	int i;
+	for (i = 0; i < ccv_min(input_size, output_size); i++)
+	{
+		const ccv_nnc_tensor_t* a = inputs[i];
+		ccv_nnc_tensor_t* b = outputs[i];
+		if (a == b)
+			continue;
+		assert(CCV_IS_TENSOR_CONTIGUOUS(a));
+		assert(CCV_IS_TENSOR_CONTIGUOUS(b));
+		assert(ccv_nnc_tensor_count(a->info) == ccv_nnc_tensor_count(b->info));
+		size_t size = 0;
+		if (CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX)
+		{
+			assert(CCV_GET_DATA_TYPE(b->info.datatype) == CCV_QX);
+			assert(a->info.datatype == b->info.datatype);
+			size = ccv_nnc_tensor_data_size_without_padding(a->info);
+			assert(size == ccv_nnc_tensor_data_size_without_padding(b->info));
+		} else {
+			assert(CCV_GET_DATA_TYPE_SIZE(a->info.datatype) == CCV_GET_DATA_TYPE_SIZE(b->info.datatype));
+			size = (ssize_t)ccv_nnc_tensor_count(a->info) * CCV_GET_DATA_TYPE_SIZE(a->info.datatype);
+		}
+		if (size == 0)
+			continue;
+		if (CCV_TENSOR_GET_MEMORY(a->info.type) == CCV_TENSOR_CPU_MEMORY && CCV_TENSOR_GET_MEMORY(b->info.type) == CCV_TENSOR_GPU_MEMORY)
+		{
+			unsigned char* const aligned_ptr = (unsigned char*)((uintptr_t)a->data.u8 & -vm_page_size);
+			const off_t offset_a = (uintptr_t)a->data.u8 - (uintptr_t)aligned_ptr;
+			const size_t aligned_size = ((size + offset_a + vm_page_size - 1) & -vm_page_size);
+			id<MTLBuffer> buffer_b = mpgetbuffer(b);
+			const off_t offset_b = mpgetoffset(b);
+			@autoreleasepool {
+				id<MTLBuffer> buffer_a = [ccv_nnc_default_device() newBufferWithBytesNoCopy:aligned_ptr length:aligned_size options:MTLResourceCPUCacheModeDefaultCache | MTLResourceStorageModeShared deallocator:nil];
+				id<MTLCommandBuffer> command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+				id<MTLBlitCommandEncoder> encoder = [command_buffer blitCommandEncoder];
+				[encoder copyFromBuffer:buffer_a sourceOffset:offset_a toBuffer:buffer_b destinationOffset:offset_b size:size];
+				[encoder endEncoding];
+				ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+				[buffer_a release];
+			}
+		} else if (CCV_TENSOR_GET_MEMORY(a->info.type) == CCV_TENSOR_GPU_MEMORY && CCV_TENSOR_GET_MEMORY(b->info.type) == CCV_TENSOR_CPU_MEMORY) {
+			id<MTLBuffer> buffer_a = mpgetbuffer(a);
+			const off_t offset_a = mpgetoffset(a);
+			unsigned char* const aligned_ptr = (unsigned char*)((uintptr_t)b->data.u8 & -vm_page_size);
+			const off_t offset_b = (uintptr_t)b->data.u8 - (uintptr_t)aligned_ptr;
+			const size_t aligned_size = ((size + offset_b + vm_page_size - 1) & -vm_page_size);
+			const int needs_fast_fence = ccv_nnc_mps_tensor_fast_fence_pending(b);
+			@autoreleasepool {
+				id<MTLBuffer> buffer_b = [ccv_nnc_default_device() newBufferWithBytesNoCopy:aligned_ptr length:aligned_size options:MTLResourceCPUCacheModeDefaultCache | MTLResourceStorageModeShared deallocator:nil];
+				MPSCommandBuffer* command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+				id<MTLBlitCommandEncoder> encoder = [command_buffer.commandBuffer blitCommandEncoder];
+				[encoder copyFromBuffer:buffer_a sourceOffset:offset_a toBuffer:buffer_b destinationOffset:offset_b size:size];
+				[encoder endEncoding];
+				const int fast_fence_encoded = !needs_fast_fence || ccv_nnc_mps_encode_tensor_fast_fence(command_buffer, b, buffer_b, aligned_ptr, aligned_size, offset_b, size);
+				ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+				if (needs_fast_fence)
+				{
+					if (fast_fence_encoded)
+						ccv_nnc_stream_context_commit(stream_context);
+					else {
+						ccv_nnc_stream_context_wait(stream_context);
+						ccv_nnc_mps_tensor_fast_fence_clear(b);
+					}
+				}
+				[buffer_b release];
+			}
+		} else if (CCV_TENSOR_GET_MEMORY(a->info.type) == CCV_TENSOR_CPU_MEMORY && CCV_TENSOR_GET_MEMORY(b->info.type) == CCV_TENSOR_CPU_MEMORY)
+			memcpy(b->data.u8, a->data.u8, size);
+		else if (CCV_TENSOR_GET_MEMORY(a->info.type) == CCV_TENSOR_GPU_MEMORY && CCV_TENSOR_GET_MEMORY(b->info.type) == CCV_TENSOR_GPU_MEMORY) {
+			const int device_a = CCV_TENSOR_GET_DEVICE_ID(a->info.type);
+			const int device_b = CCV_TENSOR_GET_DEVICE_ID(b->info.type);
+			assert(device_a == device_b);
+			id<MTLBuffer> buffer_a = mpgetbuffer(a);
+			id<MTLBuffer> buffer_b = mpgetbuffer(b);
+			const off_t offset_a = mpgetoffset(a);
+			const off_t offset_b = mpgetoffset(b);
+			@autoreleasepool {
+				id<MTLCommandBuffer> command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+				id<MTLBlitCommandEncoder> encoder = [command_buffer blitCommandEncoder];
+				[encoder copyFromBuffer:buffer_a sourceOffset:offset_a toBuffer:buffer_b destinationOffset:offset_b size:size];
+				[encoder endEncoding];
+				ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+			}
+		}
+	}
+	return CCV_NNC_EXEC_SUCCESS;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_DATA_TRANSFER_FORWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NCHW | CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_CHWN;
+	registry->tensor_datatypes = CCV_64F | CCV_32F | CCV_16F | CCV_32S | CCV_16BF | CCV_QX;
+	registry->tensor_memory = CCV_TENSOR_CPU_MEMORY | CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_data_transfer;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_DATA_TRANSFER_BACKWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NCHW | CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_CHWN;
+	registry->tensor_datatypes = CCV_64F | CCV_32F | CCV_16F | CCV_32S | CCV_16BF | CCV_QX;
+	registry->tensor_memory = CCV_TENSOR_CPU_MEMORY | CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_data_transfer;
+}
+
+static int _ccv_nnc_transpose(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint, const int flags, ccv_nnc_tensor_t* const* const inputs, const int input_size, ccv_nnc_tensor_t* const* const outputs, const int output_size, ccv_nnc_stream_context_t* const stream_context)
+{
+	assert(output_size <= input_size);
+	int i;
+	@autoreleasepool {
+		ccv_nnc_mfa_context_t* const mfa_context = ccv_nnc_default_mfa_context();
+		const int use_mfa = ccv_nnc_mfa_context_supported(mfa_context) && !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA);
+		MPSCommandBuffer* command_buffer = nil;
+		for (i = 0; i < output_size; i++)
+		{
+			const ccv_nnc_tensor_view_t* const a = (const ccv_nnc_tensor_view_t*)inputs[i];
+			ccv_nnc_tensor_view_t* const b = (ccv_nnc_tensor_view_t*)outputs[i];
+			if (ccv_nnc_tensor_count(a->info) == 0 || ccv_nnc_tensor_count(b->info) == 0)
+				continue;
+			const int nd = ccv_nnc_tensor_nd(a->info.dim);
+			const int axis_a = cmd.info.transpose.axis[0] < 0 ? cmd.info.transpose.axis[0] + nd : cmd.info.transpose.axis[0];
+			const int axis_b = cmd.info.transpose.axis[1] < 0 ? cmd.info.transpose.axis[1] + nd : cmd.info.transpose.axis[1];
+			if (use_mfa && nd >= 2 && nd <= 3 && nd == ccv_nnc_tensor_nd(b->info.dim) &&
+				((axis_a == nd - 2 && axis_b == nd - 1) || (axis_a == nd - 1 && axis_b == nd - 2)) &&
+				a->info.datatype == b->info.datatype && (a->info.datatype == CCV_16F || a->info.datatype == CCV_16BF || a->info.datatype == CCV_32F) &&
+				a->info.dim[nd - 2] == b->info.dim[nd - 1] && a->info.dim[nd - 1] == b->info.dim[nd - 2] &&
+				(nd != 3 || a->info.dim[0] == b->info.dim[0]))
+			{
+				const static int no_transpose[2] = {};
+				int a_batch_size, a_rows, a_cols, a_batch_inc, a_rows_inc, a_cols_inc;
+				int b_batch_size, b_rows, b_cols, b_batch_inc, b_rows_inc, b_cols_inc;
+				ccv_nnc_tensor_get_matrix_params(a->info, CCV_IS_TENSOR_VIEW(a) ? a->stride : 0, a->info.dim, no_transpose, &a_batch_size, &a_rows, &a_cols, &a_batch_inc, &a_rows_inc, &a_cols_inc);
+				ccv_nnc_tensor_get_matrix_params(b->info, CCV_IS_TENSOR_VIEW(b) ? b->stride : 0, b->info.dim, no_transpose, &b_batch_size, &b_rows, &b_cols, &b_batch_inc, &b_rows_inc, &b_cols_inc);
+				const int a_matrix_stride = nd == 3 ? a_batch_inc : a_rows_inc * a_rows;
+				const int b_matrix_stride = nd == 3 ? b_batch_inc : b_rows_inc * b_rows;
+				id<MTLBuffer> a_buffer = mpgetbuffer((ccv_nnc_tensor_t*)a);
+				id<MTLBuffer> b_buffer = mpgetbuffer((ccv_nnc_tensor_t*)b);
+				if (a_buffer != b_buffer && a_batch_size == b_batch_size && a_rows == b_cols && a_cols == b_rows &&
+					a_cols_inc == 1 && b_cols_inc == 1 && a_rows_inc >= a_cols && b_rows_inc >= b_cols &&
+					a_matrix_stride >= a_rows_inc * a_rows && b_matrix_stride >= b_rows_inc * b_rows)
+				{
+					const ccv_nnc_mfa_transpose_params_t transpose_params = {
+						.data_type = a->info.datatype == CCV_16F ? 16 : (a->info.datatype == CCV_16BF ? 121 : 3),
+						.batch_size = a_batch_size,
+						.rows = a_rows,
+						.cols = a_cols,
+						.source_batch_stride = a_matrix_stride,
+						.source_row_stride = a_rows_inc,
+						.destination_batch_stride = b_matrix_stride,
+						.destination_row_stride = b_rows_inc,
+					};
+					if (command_buffer)
+					{
+						ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+						command_buffer = nil;
+					}
+					mtl_command_batch_t* const command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+					mtl_buffer_t* tensors[] = {
+						a_buffer,
+						b_buffer,
+						0,
+					};
+					size_t tensor_offsets[] = {
+						mpgetoffset((ccv_nnc_tensor_t*)a),
+						mpgetoffset((ccv_nnc_tensor_t*)b),
+					};
+					ccv_nnc_mfa_encode_transpose(mfa_context, transpose_params, command_batch, tensors, tensor_offsets);
+					ccv_nnc_stream_context_finish_command_batch(stream_context, command_batch);
+					continue;
+				}
+			}
+			if (!command_buffer)
+				command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+			ccv_nnc_mps_graph_key_t key = ccv_nnc_mps_graph_key_new(cmd, 0, hint, flags, inputs + i, 1, outputs + i, 1);
+			int indices[1];
+			MPSGraphExecutable* executable = ccv_nnc_mps_graph_executable_cache(key, indices, ^void (MPSGraph* graph, NSMutableArray<MPSGraphTensor*>* inputTensors, NSMutableArray<MPSGraphShapedType*>* inputShapedTypes, NSMutableArray<MPSGraphTensor*>* resultTensors) {
+				MPSGraphTensor* mps_input_a;
+				MPSGraphTensor* mps_a = ccv_nnc_mps_graph_tensor_input(graph, a, a->info.dim, a->stride, &mps_input_a);
+				[inputTensors addObject:mps_input_a];
+				MPSGraphShapedType* mps_a_shape = ccv_nnc_mps_graph_tensor_input_shape(a, a->info.dim, a->stride);
+				[inputShapedTypes addObject:mps_a_shape];
+				MPSGraphTensor* mps_b = [graph transposeTensor:mps_a dimension:cmd.info.transpose.axis[0] withDimension:cmd.info.transpose.axis[1] name:nil];
+				[resultTensors addObject:mps_b];
+			});
+			MPSGraphTensorData* data_a = ccv_nnc_mps_graph_tensor_data(a, a->info.dim, a->stride);
+			ccv_nnc_mps_graph_executable_result(executable, command_buffer, @[data_a], &b, (int*[]){ b->info.dim }, (int*[]){ b->stride }, 1, 0);
+		}
+		if (command_buffer)
+			ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+	}
+	return CCV_NNC_EXEC_SUCCESS;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_TRANSPOSE_FORWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NCHW | CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_CHWN;
+	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_16BF;
+	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_transpose;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_TRANSPOSE_BACKWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NCHW | CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_CHWN;
+	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_16BF;
+	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_transpose;
+}
+
+static int _ccv_nnc_set_forw(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint, const int flags, ccv_nnc_tensor_t* const* const inputs, const int input_size, ccv_nnc_tensor_t* const* const outputs, const int output_size, ccv_nnc_stream_context_t* const stream_context)
+{
+	int i, j;
+	int executable_output_size = 0;
+	for (i = 0; i < output_size; i++)
+		executable_output_size += outputs[i]->info.dim[0] != 0;
+	if (executable_output_size == 0)
+		return CCV_NNC_EXEC_SUCCESS;
+	@autoreleasepool {
+		MPSCommandBuffer* command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+		for (i = 0; i < output_size; i++)
+		{
+			ccv_nnc_tensor_view_t* const a = (ccv_nnc_tensor_view_t*)outputs[i];
+			if (a->info.dim[0] == 0)
+				continue;
+			ccv_nnc_mps_graph_key_t key = ccv_nnc_mps_graph_key_new(cmd, 0, hint, flags, 0, 0, outputs + i, 1);
+			NSMutableArray<NSNumber*>* shape = [NSMutableArray new];
+			const int nd = ccv_nnc_tensor_nd(a->info.dim);
+			for (j = 0; j < nd; j++)
+				[shape addObject:@(a->info.dim[j])];
+			MPSGraphExecutable* executable = ccv_nnc_mps_graph_executable_cache(key, 0, ^void (MPSGraph* graph, NSMutableArray<MPSGraphTensor*>* inputTensors, NSMutableArray<MPSGraphShapedType*>* inputShapedTypes, NSMutableArray<MPSGraphTensor*>* resultTensors) {
+				MPSGraphTensor* mps_a = [graph constantWithScalar:cmd.info.blas.a[0] shape:shape dataType:ccv_nnc_mps_datatype(a->info.datatype)];
+				[resultTensors addObject:mps_a];
+			});
+			[shape release];
+			ccv_nnc_mps_graph_executable_result(executable, command_buffer, @[], &a, (int*[]){ a->info.dim }, (int*[]){ a->stride }, 1, 0);
+		}
+		ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+	}
+	return CCV_NNC_EXEC_SUCCESS;
+}
+
+static int _ccv_nnc_set_back(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint, const int flags, ccv_nnc_tensor_t* const* const inputs, const int input_size, ccv_nnc_tensor_t* const* const outputs, const int output_size, ccv_nnc_stream_context_t* const stream_context)
+{
+	int i, j;
+	int executable_output_size = 0;
+	for (i = 0; i < output_size; i++)
+		executable_output_size += outputs[i]->info.dim[0] != 0;
+	if (executable_output_size == 0)
+		return CCV_NNC_EXEC_SUCCESS;
+	@autoreleasepool {
+		MPSCommandBuffer* command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+		for (i = 0; i < output_size; i++)
+		{
+			ccv_nnc_tensor_view_t* const a = (ccv_nnc_tensor_view_t*)outputs[i];
+			if (a->info.dim[0] == 0)
+				continue;
+			ccv_nnc_mps_graph_key_t key = ccv_nnc_mps_graph_key_new(cmd, 0, hint, flags, 0, 0, outputs + i, 1);
+			NSMutableArray<NSNumber*>* shape = [NSMutableArray new];
+			const int nd = ccv_nnc_tensor_nd(a->info.dim);
+			for (j = 0; j < nd; j++)
+				[shape addObject:@(a->info.dim[j])];
+			MPSGraphExecutable* executable = ccv_nnc_mps_graph_executable_cache(key, 0, ^void (MPSGraph* graph, NSMutableArray<MPSGraphTensor*>* inputTensors, NSMutableArray<MPSGraphShapedType*>* inputShapedTypes, NSMutableArray<MPSGraphTensor*>* resultTensors) {
+				MPSGraphTensor* mps_a = [graph constantWithScalar:0 shape:shape dataType:ccv_nnc_mps_datatype(a->info.datatype)];
+				[resultTensors addObject:mps_a];
+			});
+			[shape release];
+			ccv_nnc_mps_graph_executable_result(executable, command_buffer, @[], &a, (int*[]){ a->info.dim }, (int*[]){ a->stride }, 1, 0);
+		}
+		ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+	}
+	return CCV_NNC_EXEC_SUCCESS;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_SET_FORWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NCHW | CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_CHWN;
+	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_32S | CCV_16BF;
+	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_set_forw;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_SET_BACKWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NCHW | CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_CHWN;
+	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_32S | CCV_16BF;
+	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_set_back;
+}
+
+static int _ccv_nnc_format_transform(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint, const int flags, ccv_nnc_tensor_t* const* const inputs, const int input_size, ccv_nnc_tensor_t* const* const outputs, const int output_size, ccv_nnc_stream_context_t* const stream_context)
+{
+	assert(output_size <= input_size);
+	int i;
+	@autoreleasepool {
+		MPSCommandBuffer* command_buffer = nil;
+		ccv_nnc_mfa_context_t* const mfa_context = ccv_nnc_default_mfa_context();
+		const int use_mfa = ccv_nnc_mfa_context_supported(mfa_context) && !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA);
+		for (i = 0; i < output_size; i++)
+		{
+			const ccv_nnc_tensor_view_t* const a = (const ccv_nnc_tensor_view_t*)inputs[i];
+			const ccv_nnc_tensor_view_t* const b = (const ccv_nnc_tensor_view_t*)outputs[i];
+			if (ccv_nnc_tensor_count(a->info) == 0 || ccv_nnc_tensor_count(b->info) == 0)
+				continue;
+			// If this is just normal data transfer, do this.
+			if (a->info.format == b->info.format && CCV_IS_TENSOR_CONTIGUOUS(a) && CCV_IS_TENSOR_CONTIGUOUS(b) && ccv_nnc_tensor_count(a->info) == ccv_nnc_tensor_count(b->info) && CCV_GET_DATA_TYPE_SIZE(a->info.datatype) == CCV_GET_DATA_TYPE_SIZE(b->info.datatype))
+			{
+				const size_t size = (ssize_t)ccv_nnc_tensor_count(a->info) * CCV_GET_DATA_TYPE_SIZE(a->info.datatype);
+				if (size == 0)
+					continue;
+				const int device_a = CCV_TENSOR_GET_DEVICE_ID(a->info.type);
+				const int device_b = CCV_TENSOR_GET_DEVICE_ID(b->info.type);
+				assert(device_a == device_b);
+				if (!command_buffer)
+					command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+				id<MTLBuffer> buffer_a = mpgetbuffer((const ccv_nnc_tensor_t*)a);
+				id<MTLBuffer> buffer_b = mpgetbuffer((const ccv_nnc_tensor_t*)b);
+				const off_t offset_a = mpgetoffset((const ccv_nnc_tensor_t*)a);
+				const off_t offset_b = mpgetoffset((const ccv_nnc_tensor_t*)b);
+				@autoreleasepool {
+					id<MTLBlitCommandEncoder> encoder = [command_buffer blitCommandEncoder];
+					[encoder copyFromBuffer:buffer_a sourceOffset:offset_a toBuffer:buffer_b destinationOffset:offset_b size:size];
+					[encoder endEncoding];
+				}
+				continue;
+			}
+			if (use_mfa && a->info.format == b->info.format && a->info.datatype == b->info.datatype &&
+				CCV_TENSOR_GET_MEMORY(a->info.type) == CCV_TENSOR_GPU_MEMORY &&
+				CCV_TENSOR_GET_MEMORY(b->info.type) == CCV_TENSOR_GPU_MEMORY &&
+				ccv_nnc_tensor_count(a->info) == ccv_nnc_tensor_count(b->info))
+			{
+				const int a_nd = ccv_nnc_tensor_nd(a->info.dim);
+				const int b_nd = ccv_nnc_tensor_nd(b->info.dim);
+				uint32_t rows = 0, cols = 0, source_row_stride = 0, destination_row_stride = 0;
+				if (a_nd == 2 && b_nd == 2 && a->info.dim[0] == b->info.dim[0] && a->info.dim[1] == b->info.dim[1] &&
+					a->info.dim[0] > 0 && a->info.dim[1] > 0)
+				{
+					if (CCV_IS_TENSOR_VIEW(a) && CCV_IS_TENSOR_CONTIGUOUS(b) &&
+						a->stride[1] == 1 && a->stride[0] >= a->info.dim[1])
+					{
+						rows = (uint32_t)a->info.dim[0];
+						cols = (uint32_t)a->info.dim[1];
+						source_row_stride = (uint32_t)a->stride[0];
+						destination_row_stride = cols;
+					} else if (CCV_IS_TENSOR_VIEW(b) && !CCV_IS_TENSOR_CONTIGUOUS(b) &&
+						b->stride[1] == 1 && b->stride[0] >= b->info.dim[1])
+					{
+						if (CCV_IS_TENSOR_VIEW(a))
+						{
+							if (a->stride[1] == 1 && a->stride[0] >= a->info.dim[1])
+								source_row_stride = (uint32_t)a->stride[0];
+						} else {
+							source_row_stride = (uint32_t)a->info.dim[1];
+						}
+						if (source_row_stride > 0)
+						{
+							rows = (uint32_t)a->info.dim[0];
+							cols = (uint32_t)a->info.dim[1];
+							destination_row_stride = (uint32_t)b->stride[0];
+						}
+					}
+				}
+				if (rows > 0)
+				{
+					uint32_t mtl_data_type = UINT32_MAX;
+					switch (a->info.datatype) {
+						case CCV_16F:
+							mtl_data_type = 16;
+							break;
+						case CCV_16BF:
+							mtl_data_type = 121;
+							break;
+						case CCV_32F:
+							mtl_data_type = 3;
+							break;
+						default:
+							break;
+					}
+					id<MTLBuffer> buffer_a = mpgetbuffer((const ccv_nnc_tensor_t*)a);
+					id<MTLBuffer> buffer_b = mpgetbuffer((const ccv_nnc_tensor_t*)b);
+					if (mtl_data_type != UINT32_MAX && buffer_a != buffer_b)
+					{
+						const int device_a = CCV_TENSOR_GET_DEVICE_ID(a->info.type);
+						const int device_b = CCV_TENSOR_GET_DEVICE_ID(b->info.type);
+						assert(device_a == device_b);
+						if (command_buffer)
+						{
+							ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+							command_buffer = nil;
+						}
+						mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+						ccv_nnc_mfa_strided_copy_params_t params = {
+							.data_type = mtl_data_type,
+							.rows = rows,
+							.cols = cols,
+							.source_row_stride = source_row_stride,
+							.destination_row_stride = destination_row_stride,
+							.loadM = !!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_GEMM_SPECIALIZING_M),
+						};
+						mtl_buffer_t* tensors[3] = {
+							buffer_a,
+							buffer_b,
+							NULL
+						};
+						size_t tensor_offsets[2] = {
+							a->dataof,
+							b->dataof
+						};
+						ccv_nnc_mfa_encode_strided_copy(mfa_context, params, command_batch, tensors, tensor_offsets);
+						ccv_nnc_stream_context_finish_command_batch(stream_context, command_batch);
+						continue;
+					}
+				}
+			}
+			if (!command_buffer)
+				command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+			ccv_nnc_tensor_view_t bt = ccv_nnc_get_tensor_view(outputs[i]);
+			MPSGraph *graph = [MPSGraph new];
+			graph.options = MPSGraphOptionsSynchronizeResults;
+			int adim[CCV_NNC_MAX_DIM_ALLOC];
+			int astride[CCV_NNC_MAX_DIM_ALLOC];
+			int bdim[CCV_NNC_MAX_DIM_ALLOC];
+			int bstride[CCV_NNC_MAX_DIM_ALLOC];
+			if (a->info.format == bt.info.format)
+			{
+				memcpy(adim, a->info.dim, sizeof(adim));
+				if (CCV_IS_TENSOR_VIEW(a))
+					memcpy(astride, a->stride, sizeof(astride));
+				memcpy(bdim, bt.info.dim, sizeof(bdim));
+				if (CCV_IS_TENSOR_VIEW(&bt))
+					memcpy(bstride, bt.stride, sizeof(bstride));
+			} else {
+				ccv_nnc_tensor_view_get_dim(a, adim);
+				ccv_nnc_tensor_view_get_stride(a, astride);
+				ccv_nnc_tensor_view_get_dim(&bt, bdim);
+				ccv_nnc_tensor_view_get_stride(&bt, bstride);
+				const int b_nd = ccv_nnc_tensor_nd(bdim);
+				int j;
+				if (a->info.format == CCV_TENSOR_FORMAT_NHWC)
+				{
+					if (bt.info.format == CCV_TENSOR_FORMAT_NCHW)
+					{
+						int c = bdim[1];
+						for (j = 1; j < b_nd - 1; j++)
+							bdim[j] = bdim[j + 1];
+						bdim[b_nd - 1] = c;
+						c = bstride[1];
+						for (j = 1; j < b_nd - 1; j++)
+							bstride[j] = bstride[j + 1];
+						bstride[b_nd - 1] = c;
+					} else {
+						assert(bt.info.format == CCV_TENSOR_FORMAT_CHWN);
+						int t;
+						CCV_SWAP(bdim[0], bdim[b_nd - 1], t);
+						CCV_SWAP(bstride[0], bstride[b_nd - 1], t);
+					}
+				} else if (a->info.format == CCV_TENSOR_FORMAT_NCHW) {
+					if (bt.info.format == CCV_TENSOR_FORMAT_NHWC)
+					{
+						int c = bdim[b_nd - 1];
+						for (j = b_nd - 1; j > 1; j--)
+							bdim[j] = bdim[j - 1];
+						bdim[1] = c;
+						c = bstride[b_nd - 1];
+						for (j = b_nd - 1; j > 1; j--)
+							bstride[j] = bstride[j - 1];
+						bstride[1] = c;
+					} else {
+						assert(bt.info.format == CCV_TENSOR_FORMAT_CHWN);
+						int n = bdim[b_nd - 1];
+						for (j = b_nd - 1; j > 0; j--)
+							bdim[j] = bdim[j - 1];
+						bdim[0] = n;
+						n = bstride[b_nd - 1];
+						for (j = b_nd - 1; j > 0; j--)
+							bstride[j] = bstride[j - 1];
+						bstride[0] = n;
+					}
+				} else if (a->info.format == CCV_TENSOR_FORMAT_CHWN) {
+					if (bt.info.format == CCV_TENSOR_FORMAT_NCHW)
+					{
+						int n = bdim[0];
+						for (j = 0; j < b_nd - 1; j++)
+							bdim[j] = bdim[j + 1];
+						bdim[b_nd - 1] = n;
+						n = bstride[0];
+						for (j = 0; j < b_nd - 1; j++)
+							bstride[j] = bstride[j + 1];
+						bstride[b_nd - 1] = n;
+					} else {
+						assert(bt.info.format == CCV_TENSOR_FORMAT_NHWC);
+						int t;
+						CCV_SWAP(bdim[0], bdim[b_nd - 1], t);
+						CCV_SWAP(bstride[0], bstride[b_nd - 1], t);
+					}
+				}
+				// Mark this as tensor view as we changed its stride and dim.
+				bt.type |= CCV_TENSOR_VIEW;
+				memcpy(bt.info.dim, bdim, sizeof(bdim));
+				memcpy(bt.stride, bstride, sizeof(bstride));
+			}
+			if (adim[0] == 0 || bdim[0] == 0)
+				continue;
+			MPSGraphTensor* mps_input_a;
+			MPSGraphTensor* mps_a = ccv_nnc_mps_graph_tensor_input(graph, a, adim, astride, &mps_input_a);
+			MPSGraphTensorData* data_a = ccv_nnc_mps_graph_tensor_data(a, adim, astride);
+			if (mps_a != mps_input_a)
+				ccv_nnc_mps_graph_result(graph, command_buffer, @{mps_input_a: data_a}, mps_a, &bt, bdim, bstride);
+			else
+				ccv_nnc_mps_export_data(data_a, command_buffer, &bt, bdim, bstride);
+			[graph release];
+		}
+		if (command_buffer)
+			ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+	}
+	return CCV_NNC_EXEC_SUCCESS;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_FORMAT_TRANSFORM_FORWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NCHW | CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_CHWN;
+	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_32S | CCV_16BF;
+	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_format_transform;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_FORMAT_TRANSFORM_BACKWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NCHW | CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_CHWN;
+	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_32S | CCV_16BF;
+	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_format_transform;
+}
+
+static int _ccv_nnc_datatype_conversion(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint, const int flags, ccv_nnc_tensor_t* const* const inputs, const int input_size, ccv_nnc_tensor_t* const* const outputs, const int output_size, ccv_nnc_stream_context_t* const stream_context)
+{
+	assert(output_size <= input_size);
+	int i;
+	int executable_output_size = 0;
+	for (i = 0; i < output_size; i++)
+	{
+		const ccv_nnc_tensor_view_t* const a = (ccv_nnc_tensor_view_t*)inputs[i];
+		ccv_nnc_tensor_view_t* const b = (ccv_nnc_tensor_view_t*)outputs[i];
+		assert(a != b); // Cannot do inplace transform.
+		assert(a->info.format == b->info.format);
+		assert(CCV_TENSOR_GET_DEVICE_ID(a->info.type) == CCV_TENSOR_GET_DEVICE_ID(b->info.type));
+		const size_t length = ccv_nnc_tensor_count(a->info);
+		assert(length == ccv_nnc_tensor_count(b->info));
+		executable_output_size += length > 0;
+	}
+	if (executable_output_size == 0)
+		return CCV_NNC_EXEC_SUCCESS;
+	@autoreleasepool {
+		bool use_mfa = true;
+		const char *fallback_reason = NULL;
+		ccv_nnc_mfa_context_t* context = ccv_nnc_default_mfa_context();
+
+		if (!ccv_nnc_mfa_context_supported(context) || (ccv_nnc_flags() & CCV_NNC_DISABLE_MFA)) {
+			use_mfa = false;
+			fallback_reason = "Disabled.";
+		}
+		for (i = 0; i < output_size && use_mfa; i++)
+		{
+			const ccv_nnc_tensor_view_t* a = (ccv_nnc_tensor_view_t*)inputs[i];
+			ccv_nnc_tensor_view_t* b = (ccv_nnc_tensor_view_t*)outputs[i];
+			assert(a != b); // Cannot do inplace transform.
+			assert(a->info.format == b->info.format);
+			assert(CCV_TENSOR_GET_DEVICE_ID(a->info.type) == CCV_TENSOR_GET_DEVICE_ID(b->info.type));
+			if (ccv_nnc_tensor_count(a->info) == 0)
+				continue;
+
+			if (use_mfa) {
+				if (a->info.datatype != CCV_16F && a->info.datatype != CCV_32F && a->info.datatype != CCV_16BF) {
+					use_mfa = false;
+					fallback_reason = "Unsupported data type.";
+					break;
+				}
+				if (b->info.datatype != CCV_16F && b->info.datatype != CCV_32F && b->info.datatype != CCV_16BF) {
+					use_mfa = false;
+					fallback_reason = "Unsupported data type.";
+					break;
+				}
+			}
+
+			if (use_mfa) {
+				if (!CCV_IS_TENSOR_CONTIGUOUS(a) || !CCV_IS_TENSOR_CONTIGUOUS(b)) {
+					use_mfa = false;
+					fallback_reason = "Strided.";
+				}
+			}
+		}
+		if (use_mfa) {
+			mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+			for (i = 0; i < output_size; i++)
+			{
+				const ccv_nnc_tensor_view_t* a = (ccv_nnc_tensor_view_t*)inputs[i];
+				ccv_nnc_tensor_view_t* b = (ccv_nnc_tensor_view_t*)outputs[i];
+				const size_t length = ccv_nnc_tensor_count(a->info);
+				if (length == 0)
+					continue;
+				uint32_t mtl_original_data_type = UINT32_MAX;
+				uint32_t mtl_data_type = UINT32_MAX;
+				if (use_mfa) {
+					switch (a->info.datatype) {
+						case CCV_16F: {
+							mtl_original_data_type = 16;
+							break;
+						}
+						case CCV_16BF: {
+							mtl_original_data_type = 121;
+							break;
+						}
+						case CCV_32F: {
+							mtl_original_data_type = 3;
+							break;
+						}
+						default: {
+							use_mfa = false;
+							fallback_reason = "Unsupported data type.";
+							break;
+						}
+					}
+					switch (b->info.datatype) {
+						case CCV_16F: {
+							mtl_data_type = 16;
+							break;
+						}
+						case CCV_16BF: {
+							mtl_data_type = 121;
+							break;
+						}
+						case CCV_32F: {
+							mtl_data_type = 3;
+							break;
+						}
+						default: {
+							use_mfa = false;
+							fallback_reason = "Unsupported data type.";
+							break;
+						}
+					}
+				}
+				ccv_nnc_mfa_cast_params_t params = {
+					.original_data_type = mtl_original_data_type,
+					.data_type = mtl_data_type,
+					.length = (uint32_t)length,
+					.loadM = !!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_GEMM_SPECIALIZING_M),
+				};
+				ccv_nnc_mfa_prepare_cast(context, params);
+
+				mtl_buffer_t* tensors[3] = {
+					mpgetbuffer(inputs[i]), // gradient
+					mpgetbuffer(outputs[i]), // destination
+					NULL
+				};
+				size_t tensor_offsets[2] = {
+					a->dataof,
+					b->dataof
+				};
+				ccv_nnc_mfa_encode_cast(context, params, command_batch, tensors, tensor_offsets);
+			}
+			ccv_nnc_stream_context_finish_command_batch(stream_context, command_batch);
+		} else {
+			MPSCommandBuffer* command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+			for (i = 0; i < output_size; i++)
+			{
+				const ccv_nnc_tensor_view_t* a = (ccv_nnc_tensor_view_t*)inputs[i];
+				ccv_nnc_tensor_view_t* b = (ccv_nnc_tensor_view_t*)outputs[i];
+				if (ccv_nnc_tensor_count(a->info) == 0)
+					continue;
+				MPSGraphTensorData* data_a = ccv_nnc_mps_graph_tensor_data(a, a->info.dim, a->stride);
+				if (CCV_IS_TENSOR_VIEW(a)) // Only allocate on-demand MPSGraph if a is a tensor view.
+				{
+					MPSGraph *graph = [MPSGraph new];
+					graph.options = MPSGraphOptionsSynchronizeResults;
+					MPSGraphTensor* mps_input_a;
+					MPSGraphTensor* mps_a = ccv_nnc_mps_graph_tensor_input(graph, a, a->info.dim, a->stride, &mps_input_a);
+					if (mps_a != mps_input_a)
+						ccv_nnc_mps_graph_result(graph, command_buffer, @{mps_input_a: data_a}, mps_a, b, b->info.dim, b->stride);
+					else
+						ccv_nnc_mps_export_data(data_a, command_buffer, b, b->info.dim, b->stride);
+					[graph release];
+				} else
+					ccv_nnc_mps_export_data(data_a, command_buffer, b, b->info.dim, b->stride);
+			}
+			ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+		}
+	}
+	return CCV_NNC_EXEC_SUCCESS;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_DATATYPE_CONVERSION_FORWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NCHW | CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_CHWN;
+	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_16BF;
+	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_datatype_conversion;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_DATATYPE_CONVERSION_BACKWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NCHW | CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_CHWN;
+	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_16BF;
+	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_datatype_conversion;
+}

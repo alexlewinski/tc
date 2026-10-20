@@ -1,0 +1,141 @@
+#ifndef GUARD_ccv_nnc_mps_h
+#define GUARD_ccv_nnc_mps_h
+
+#include "nnc/ccv_nnc.h"
+#include "../mfa/ccv_nnc_mfa.hpp"
+
+struct ccv_nnc_async_callback_s;
+struct co_routine_s;
+#ifndef GUARD_ccv_nnc_async_callback_f
+#define GUARD_ccv_nnc_async_callback_f
+typedef void(*ccv_nnc_async_callback_f)(struct ccv_nnc_async_callback_s* const async);
+#endif
+
+void* mpheapalloc(int device, size_t size);
+void mpheapfree(int device, void* ptr);
+void* mpobjmalloc(int device, size_t size);
+void* mpobjcreate(void* ptr, off_t offset, size_t size);
+void mpobjfree(int device, void* ptr);
+// Acquire a whole-file mapping pin reference, or null for other buffer kinds. The buffer
+// is made GPU-resident, and the mapping is mlocked unless it exceeds half of physical memory.
+// The status is the GPU residency result where available, otherwise the mlock result.
+void* mppinmemory(void* ptr, int* status);
+// Release the mapping reference returned by mppinmemory (including failed pins).
+int mpunpinmemory(void* ptr);
+typedef void(*mpmp_f)(int device_id, void* const context);
+int mpregmp(int device_id, mpmp_f func, void* const context); // register memory pressure handler
+void mpunregmp(const int id); // un-register memory pressure handler.
+void* mpmemmap(const char* file, const size_t size, const off_t offset, const int flags);
+void mpmemcpy(void* dest, const off_t dest_off, const int dest_type, const void* src, const off_t src_off, const int src_type, size_t n);
+
+// Stream context
+int ccv_nnc_mps_fork(void);
+void ccv_nnc_mps_join(void);
+CCV_WARN_UNUSED(ccv_nnc_stream_context_t*) ccv_nnc_init_stream_context(ccv_nnc_stream_context_t* const stream_context);
+void ccv_nnc_synchronize_stream_context(const ccv_nnc_stream_context_t* const stream_context);
+void ccv_nnc_stream_compat_add_callback(ccv_nnc_stream_context_t* const stream, const ccv_nnc_callback_f callback, const ccv_nnc_async_callback_f async_callback, void* const callback_context);
+int co_stream_compat_await(struct co_routine_s* const self, ccv_nnc_stream_context_t* const stream);
+void ccv_nnc_deinit_stream_context(ccv_nnc_stream_context_t* const stream_context);
+void ccv_nnc_deinit_tensor(ccv_nnc_tensor_t* const tensor);
+CCV_WARN_UNUSED(void*) ccv_nnc_stream_compat_get_workspace(const ccv_nnc_stream_context_t* const stream_context, const size_t workspace_size, const int mem);
+void ccv_nnc_stream_compat_drain(ccv_nnc_stream_context_t* const stream_context);
+void ccv_nnc_stream_compat_commit(ccv_nnc_stream_context_t* const stream_context);
+CCV_WARN_UNUSED(mtl_command_batch_t*) ccv_nnc_stream_context_start_command_batch(ccv_nnc_stream_context_t* const stream_context);
+void ccv_nnc_stream_context_finish_command_batch(ccv_nnc_stream_context_t* const stream_context, mtl_command_batch_t* command_batch);
+CCV_WARN_UNUSED(ccv_nnc_stream_signal_t*) ccv_nnc_init_stream_signal(ccv_nnc_stream_signal_t* const signal);
+void ccv_nnc_stream_compat_emit_signal(const ccv_nnc_stream_context_t* const stream, const ccv_nnc_stream_signal_t* const signal);
+void ccv_nnc_stream_compat_wait_signal(const ccv_nnc_stream_context_t* const stream, const ccv_nnc_stream_signal_t* const signal);
+void ccv_nnc_deinit_stream_signal(ccv_nnc_stream_signal_t* const signal);
+CCV_WARN_UNUSED(int) ccv_nnc_gpu_device_count(void);
+void ccv_nnc_mps_set_queue_watermark(int watermark);
+CCV_WARN_UNUSED(int) ccv_nnc_mps_queue_watermark(void);
+void ccv_nnc_mps_set_whole_file_mapping_size_limit(size_t size_limit);
+void ccv_nnc_mps_clear_graph_executable_cache(void);
+void ccv_nnc_mps_depalettize(const void* input, const int datatype, const size_t input_length, const int qbits, const int number_in_blocks, void* output, const size_t output_length, void* const command_buffer);
+void ccv_nnc_mps_dequantize_8i_rowwise(const void* input, const int datatype, const size_t input_length, const size_t row_length, void* output, const size_t output_length, void* const command_buffer);
+void ccv_nnc_mps_dequantize_8i_rowwise_x(const void* input, const int datatype, const size_t input_length, const size_t row_length, const int format, void* output, const size_t output_length, void* const command_buffer);
+void ccv_nnc_mps_set_binary_artifacts(const char** const paths_to_read, const int paths_to_read_size, const char* const path_to_write);
+int ccv_nnc_mps_tensor_fast_fence_mark_pending(ccv_nnc_tensor_t* const tensor);
+int ccv_nnc_mps_tensor_fast_fence_pending(const ccv_nnc_tensor_t* const tensor);
+void ccv_nnc_mps_tensor_fast_fence_clear(ccv_nnc_tensor_t* const tensor);
+void ccv_nnc_mps_tensor_fast_fence_wait(ccv_nnc_tensor_t* const tensor);
+ccv_nnc_mfa_context_t* ccv_nnc_default_mfa_context(void);
+
+#ifdef __OBJC__
+
+#import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+
+typedef struct {
+	int format;
+	int datatype;
+	int nd;
+	off_t dataof;
+	int dim[CCV_NNC_MAX_DIM_ALLOC];
+	int stride[CCV_NNC_MAX_DIM_ALLOC];
+} ccv_nnc_mps_graph_tensor_shape_t;
+
+typedef struct {
+	uint32_t cmd;
+	ccv_nnc_cmd_param_t params;
+	ccv_nnc_hint_t hint;
+	int flags;
+	int index;
+	int input_size;
+	int output_size;
+	ccv_nnc_mps_graph_tensor_shape_t* inputs;
+	ccv_nnc_mps_graph_tensor_shape_t* outputs;
+} ccv_nnc_mps_graph_key_t;
+
+typedef struct {
+	NSString* path; /**< Borrowed for the lifetime of the tensor. */
+	off_t offset; /**< File offset corresponding to the tensor's current data offset. */
+	size_t size; /**< Bytes available from offset. */
+} ccv_nnc_mps_file_backed_region_t;
+
+off_t mpgetoffset(const ccv_nnc_tensor_t* const tensor);
+id<MTLBuffer> mpgetbuffer(const ccv_nnc_tensor_t* const tensor);
+/** Returns 1 for an on-demand file-backed tensor and 0 for any other tensor. */
+int ccv_nnc_mps_file_backed_region(const ccv_nnc_tensor_t* tensor, ccv_nnc_mps_file_backed_region_t* region);
+id<MTLDevice> ccv_nnc_default_device(void);
+MPSGraphDevice* ccv_nnc_default_mps_device(void);
+CCV_WARN_UNUSED(MPSCommandBuffer*) ccv_nnc_stream_context_start_mps_command_buffer(ccv_nnc_stream_context_t* const stream_context);
+CCV_WARN_UNUSED(MPSCommandBuffer*) ccv_nnc_stream_context_finish_command_batch_encoding_and_return_mps_command_buffer(ccv_nnc_stream_context_t* const stream_context, MTLCommandBatch* command_batch);
+void ccv_nnc_stream_context_finish_mps_command_buffer(ccv_nnc_stream_context_t* const stream_context, MPSCommandBuffer* command_buffer);
+/** Makes the input range system-coherent, then conditionally changes timestamp from expected to value. */
+int ccv_nnc_mps_encode_fast_fence_signal_in_command_batch(MTLCommandBatch* command_batch, id<MTLBuffer> timestamp, size_t timestamp_offset, uint32_t expected, uint32_t value, id<MTLBuffer> input, off_t input_offset, size_t input_size);
+/** Waits until the system-coherent timestamp is at least value and orders later buffer accesses after it. */
+int ccv_nnc_mps_encode_fast_fence_wait_in_command_batch(MTLCommandBatch* command_batch, id<MTLBuffer> timestamp, size_t timestamp_offset, uint32_t value);
+
+typedef struct {
+	id<MTLBuffer> buffer;
+	off_t offset;
+	ccv_nnc_tensor_param_t info;
+	id<MTLBuffer> readiness_buffer;
+	uint32_t readiness_value;
+} ccv_nnc_mps_moe_weights_view_t;
+
+/** Encodes the CPU-to-GPU readiness wait in the consumer's command batch. */
+void ccv_nnc_mps_moe_weights_encode_wait(const ccv_nnc_tensor_t* tensor, MTLCommandBatch* command_batch);
+/** Returns 0 for an ordinary tensor, 1 for a resolved staging handle, and -1 on failure. */
+int ccv_nnc_mps_moe_weights_resolve(const ccv_nnc_tensor_t* tensor, ccv_nnc_mps_moe_weights_view_t* view);
+/** Finishes a consumer batch and retires the prefill staging leases used by its weight tensors. */
+void ccv_nnc_mps_moe_weights_finish_command_batch(ccv_nnc_tensor_t* const* tensors, int tensor_count, ccv_nnc_stream_context_t* stream_context, MTLCommandBatch* command_batch);
+int ccv_nnc_mps_encode_tensor_fast_fence(MPSCommandBuffer* const command_buffer, ccv_nnc_tensor_t* const tensor, id<MTLBuffer> const buffer, unsigned char* const aligned_ptr, const size_t aligned_size, const off_t offset, const size_t size);
+CCV_WARN_UNUSED(MPSGraphExecutable*) ccv_nnc_mps_graph_executable_cache(const ccv_nnc_mps_graph_key_t key, int* indices, void(NS_NOESCAPE ^block)(MPSGraph* graph, NSMutableArray<MPSGraphTensor*>* inputTensors, NSMutableArray<MPSGraphShapedType*>* inputShapedTypes, NSMutableArray<MPSGraphTensor*>* resultTensors));
+CCV_WARN_UNUSED(ccv_nnc_mps_graph_key_t) ccv_nnc_mps_graph_key_new(const ccv_nnc_cmd_t cmd, const int index, const ccv_nnc_hint_t hint, const int flags, ccv_nnc_tensor_t* const* const inputs, const int input_size, ccv_nnc_tensor_t* const* const outputs, const int output_size);
+CCV_WARN_UNUSED(MPSDataType) ccv_nnc_mps_datatype(const int datatype); // Get the datatype corresponding to MPS datatype.
+CCV_WARN_UNUSED(MPSGraphTensorNamedDataLayout) ccv_nnc_mps_tensor_data_layout(const int format); // Get the format corresponding to MPS data layout.
+CCV_WARN_UNUSED(MPSGraphTensor*) ccv_nnc_mps_graph_tensor_input(MPSGraph* graph, const ccv_nnc_tensor_view_t* tensor_view, const int dim[CCV_NNC_MAX_DIM_ALLOC], const int stride[CCV_NNC_MAX_DIM_ALLOC], MPSGraphTensor** input);
+CCV_WARN_UNUSED(MPSGraphShapedType*) ccv_nnc_mps_graph_tensor_input_shape(const ccv_nnc_tensor_view_t* tensor_view, const int dim[CCV_NNC_MAX_DIM_ALLOC], const int stride[CCV_NNC_MAX_DIM_ALLOC]);
+CCV_WARN_UNUSED(MPSGraphTensorData*) ccv_nnc_mps_graph_tensor_data(const ccv_nnc_tensor_view_t* tensor_view, const int dim[CCV_NNC_MAX_DIM_ALLOC], const int stride[CCV_NNC_MAX_DIM_ALLOC]);
+CCV_WARN_UNUSED(MPSGraphTensorData*) ccv_nnc_mps_graph_tensor_data_with_buffer(const ccv_nnc_tensor_view_t* tensor_view, const int dim[CCV_NNC_MAX_DIM_ALLOC], const int stride[CCV_NNC_MAX_DIM_ALLOC], void* buffer, const off_t offset);
+CCV_WARN_UNUSED(MPSGraphTensorData*) ccv_nnc_mps_graph_constant_data(const float val, const int datatype);
+void ccv_nnc_mps_export_data(MPSGraphTensorData* data, MPSCommandBuffer* command_buffer, ccv_nnc_tensor_view_t* const tensor, const int dim[CCV_NNC_MAX_DIM_ALLOC], const int stride[CCV_NNC_MAX_DIM_ALLOC]);
+void ccv_nnc_mps_graph_result(MPSGraph* graph, MPSCommandBuffer* command_buffer, MPSGraphTensorDataDictionary* feeds, MPSGraphTensor* output, ccv_nnc_tensor_view_t* const data, const int dim[CCV_NNC_MAX_DIM_ALLOC], const int stride[CCV_NNC_MAX_DIM_ALLOC]);
+void ccv_nnc_mps_graph_executable_result(MPSGraphExecutable* executable, MPSCommandBuffer* command_buffer, NSArray<MPSGraphTensorData*>* inputsArray, ccv_nnc_tensor_view_t* const* const data, int* dim[CCV_NNC_MAX_DIM_ALLOC], int* stride[CCV_NNC_MAX_DIM_ALLOC], const int size, const int force_export_data);
+
+#endif
+
+#endif

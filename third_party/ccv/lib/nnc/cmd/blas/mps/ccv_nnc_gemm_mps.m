@@ -1,0 +1,1560 @@
+#include "ccv.h"
+#include "ccv_internal.h"
+#include "nnc/ccv_nnc.h"
+#include "nnc/ccv_nnc_easy.h"
+#include "nnc/ccv_nnc_internal.h"
+#include <Foundation/Foundation.h>
+#ifdef HAVE_MPS
+#include "nnc/mps/ccv_nnc_mps.h"
+#endif
+#ifdef USE_OPENMP
+#include <omp.h>
+#endif
+#ifdef USE_DISPATCH
+#include <dispatch/dispatch.h>
+#endif
+
+typedef struct {
+	int subtype;
+	ccv_nnc_mfa_depalettize_params_t depalettize_params;
+	ccv_nnc_mfa_dequantize_8i_rowwise_params_t dequantize_8i_rowwise_params;
+	ccv_nnc_mfa_dequantize_8i_rowwise_x_fp_params_t dequantize_8i_rowwise_x_fp_params;
+} ccv_nnc_mfa_qx_decode_params_t;
+
+static size_t _ccv_nnc_qx_fp_data_size(const ccv_nnc_tensor_param_t params)
+{
+	const int subtype = params.datatype & 0xf00;
+	ccv_nnc_tensor_param_t dense_params = params;
+	dense_params.datatype = (params.datatype & 0xff) << 12;
+	dense_params.reserved = 0;
+	if ((subtype >= 0x400 && subtype <= 0x800) || subtype == CCV_NNC_QX_8I_ROWWISE || subtype == CCV_NNC_QX_8I_ROWWISE_X)
+		return ccv_nnc_tensor_data_size(dense_params);
+	assert(0);
+	return 0;
+}
+
+static ccv_nnc_mfa_qx_decode_params_t _ccv_nnc_mfa_qx_decode_params(const ccv_nnc_tensor_param_t params, const uint32_t mtl_data_type)
+{
+	const int subtype = params.datatype & 0xf00;
+	ccv_nnc_mfa_qx_decode_params_t decode_params = {
+		.subtype = subtype,
+	};
+	if (subtype >= 0x400 && subtype <= 0x800)
+	{
+		const size_t count = ccv_nnc_tensor_count(params);
+		const int qbits = subtype >> 8;
+		decode_params.depalettize_params = (ccv_nnc_mfa_depalettize_params_t){
+			.data_type = mtl_data_type,
+			.qbits = (uint32_t)qbits,
+			.number_in_blocks = (uint32_t)params.reserved,
+			.length = (uint64_t)count,
+		};
+	} else if (subtype == CCV_NNC_QX_8I_ROWWISE) {
+		const int nd = ccv_nnc_tensor_nd(params.dim);
+		decode_params.dequantize_8i_rowwise_params = (ccv_nnc_mfa_dequantize_8i_rowwise_params_t){
+			.data_type = mtl_data_type,
+			.row_length = (uint64_t)params.dim[nd - 1],
+			.length = (uint64_t)ccv_nnc_tensor_count(params),
+		};
+	} else if (subtype == CCV_NNC_QX_8I_ROWWISE_X) {
+		const int nd = ccv_nnc_tensor_nd(params.dim);
+		decode_params.dequantize_8i_rowwise_x_fp_params = (ccv_nnc_mfa_dequantize_8i_rowwise_x_fp_params_t){
+			.data_type = mtl_data_type,
+			.format = (uint32_t)params.reserved,
+			.row_length = (uint64_t)params.dim[nd - 1],
+			.length = (uint64_t)ccv_nnc_tensor_count(params),
+		};
+	} else {
+		assert(0);
+	}
+	return decode_params;
+}
+
+static void _ccv_nnc_mfa_prepare_qx_decode(ccv_nnc_mfa_context_t* const context, const ccv_nnc_mfa_qx_decode_params_t params)
+{
+	if (params.subtype >= 0x400 && params.subtype <= 0x800)
+		ccv_nnc_mfa_prepare_depalettize(context, params.depalettize_params);
+	else if (params.subtype == CCV_NNC_QX_8I_ROWWISE)
+		ccv_nnc_mfa_prepare_dequantize_8i_rowwise(context, params.dequantize_8i_rowwise_params);
+	else if (params.subtype == CCV_NNC_QX_8I_ROWWISE_X)
+		ccv_nnc_mfa_prepare_dequantize_8i_rowwise_x_fp(context, params.dequantize_8i_rowwise_x_fp_params);
+	else {
+		assert(0);
+	}
+}
+
+static void _ccv_nnc_mfa_encode_qx_decode(ccv_nnc_mfa_context_t* const context, const ccv_nnc_mfa_qx_decode_params_t params, mtl_command_batch_t* const command_batch, mtl_buffer_t* const source, const size_t source_offset, mtl_buffer_t* const destination, const size_t destination_offset)
+{
+	mtl_buffer_t* tensors[3] = {
+		source,
+		destination,
+		NULL,
+	};
+	size_t tensor_offsets[2] = {
+		source_offset,
+		destination_offset,
+	};
+	if (params.subtype >= 0x400 && params.subtype <= 0x800)
+		ccv_nnc_mfa_encode_depalettize(context, params.depalettize_params, command_batch, tensors, tensor_offsets);
+	else if (params.subtype == CCV_NNC_QX_8I_ROWWISE)
+		ccv_nnc_mfa_encode_dequantize_8i_rowwise(context, params.dequantize_8i_rowwise_params, command_batch, tensors, tensor_offsets);
+	else if (params.subtype == CCV_NNC_QX_8I_ROWWISE_X)
+		ccv_nnc_mfa_encode_dequantize_8i_rowwise_x_fp(context, params.dequantize_8i_rowwise_x_fp_params, command_batch, tensors, tensor_offsets);
+	else {
+		assert(0);
+	}
+}
+
+static size_t _ccv_nnc_gemm_align_up(const size_t value, const size_t alignment)
+{
+	return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static size_t _ccv_nnc_8i_rowwise_data_size(const size_t rows, const size_t cols, const int datatype)
+{
+	const size_t scale_offset = _ccv_nnc_gemm_align_up(rows * cols, 128);
+	return scale_offset + rows * CCV_GET_DATA_TYPE_SIZE(datatype);
+}
+
+static ccv_nnc_mfa_dequantize_8i_rowwise_x_params_t _ccv_nnc_8i_rowwise_x_decode_params(const uint32_t data_type, const uint32_t format, const uint32_t rows, const uint32_t cols)
+{
+	return (ccv_nnc_mfa_dequantize_8i_rowwise_x_params_t){
+		.data_type = data_type,
+		.format = format,
+		.row_length = cols,
+		.length = (uint64_t)rows * cols,
+	};
+}
+
+static void _ccv_nnc_mfa_encode_8i_rowwise_x_decode(ccv_nnc_mfa_context_t* const context, const ccv_nnc_mfa_dequantize_8i_rowwise_x_params_t params, mtl_command_batch_t* const command_batch, mtl_buffer_t* const source, const size_t source_offset, mtl_buffer_t* const destination, const size_t destination_offset)
+{
+	mtl_buffer_t* tensors[3] = {
+		source,
+		destination,
+		NULL,
+	};
+	size_t tensor_offsets[2] = {
+		source_offset,
+		destination_offset,
+	};
+	ccv_nnc_mfa_encode_dequantize_8i_rowwise_x(context, params, command_batch, tensors, tensor_offsets);
+}
+
+static int _ccv_nnc_gemm_forw(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint, const int flags, ccv_nnc_tensor_t* const* const inputs, const int input_size, ccv_nnc_tensor_t* const* const outputs, const int output_size, ccv_nnc_stream_context_t* const stream_context)
+{
+	assert(input_size >= 2);
+	const ccv_nnc_tensor_view_t* a = (const ccv_nnc_tensor_view_t*)inputs[0];
+	const ccv_nnc_tensor_view_t* w = (const ccv_nnc_tensor_view_t*)inputs[1];
+	const ccv_nnc_tensor_view_t* bias = input_size > 2 ? (const ccv_nnc_tensor_view_t*)inputs[2] : 0;
+	assert(output_size == 1);
+	ccv_nnc_tensor_view_t* b = (ccv_nnc_tensor_view_t*)outputs[0];
+	if (a->info.dim[0] == 0 || w->info.dim[0] == 0 || b->info.dim[0] == 0)
+		return CCV_NNC_EXEC_SUCCESS;
+	assert(!bias || (bias->info.dim[1] == 0 || bias->info.dim[2] == 0 || bias->info.dim[3] == 0)); // It is a 1-d array
+	int a_batch_size, a_rows, a_cols, a_batch_inc, a_rows_inc, a_cols_inc;
+	int w_batch_size, w_rows, w_cols, w_batch_inc, w_rows_inc, w_cols_inc;
+	int b_batch_size, b_rows, b_cols, b_batch_inc, b_rows_inc, b_cols_inc;
+	const static int no_transpose[2] = {};
+	ccv_nnc_tensor_get_matrix_params(a->info, CCV_IS_TENSOR_VIEW(a) ? a->stride : 0, a->info.dim, cmd.info.blas.transpose_a, &a_batch_size, &a_rows, &a_cols, &a_batch_inc, &a_rows_inc, &a_cols_inc);
+	ccv_nnc_tensor_get_matrix_params(w->info, CCV_IS_TENSOR_VIEW(w) ? w->stride : 0, w->info.dim, cmd.info.blas.transpose_b, &w_batch_size, &w_rows, &w_cols, &w_batch_inc, &w_rows_inc, &w_cols_inc);
+	ccv_nnc_tensor_get_matrix_params(b->info, CCV_IS_TENSOR_VIEW(b) ? b->stride : 0, b->info.dim, no_transpose, &b_batch_size, &b_rows, &b_cols, &b_batch_inc, &b_rows_inc, &b_cols_inc);
+	assert(a_rows == b_rows);
+	assert(a_cols == w_rows);
+	assert(w_cols == b_cols);
+	int adim[CCV_NNC_MAX_DIM_ALLOC];
+	int astride[CCV_NNC_MAX_DIM_ALLOC] = {0};
+	memcpy(adim, a->info.dim, sizeof(adim));
+	if (CCV_IS_TENSOR_VIEW(a))
+		memcpy(astride, a->stride, sizeof(astride));
+	assert(ccv_nnc_tensor_nd(w->info.dim) >= 2);
+	const int is_transpose_a = ccv_nnc_is_matrix_transpose(a->info, cmd.info.blas.transpose_a);
+	if (ccv_nnc_tensor_nd(adim) < 2)
+	{
+		if (is_transpose_a)
+		{
+			adim[1] = 1;
+			astride[1] = astride[0];
+		} else {
+			adim[1] = adim[0];
+			astride[1] = astride[0];
+			adim[0] = 1;
+			astride[0] = astride[1];
+		}
+	}
+	int bstride[CCV_NNC_MAX_DIM_ALLOC] = {0};
+	if (CCV_IS_TENSOR_VIEW(b))
+		memcpy(bstride, b->stride, sizeof(bstride));
+	const int is_transpose_w = ccv_nnc_is_matrix_transpose(w->info, cmd.info.blas.transpose_b);
+	int biasdim[CCV_NNC_MAX_DIM_ALLOC] = {0};
+	int biasstride[CCV_NNC_MAX_DIM_ALLOC] = {0};
+	int bias_batch_size = 1;
+	const int b_nd = ccv_nnc_tensor_nd(b->info.dim);
+	if (bias)
+	{
+		assert(CCV_GET_DATA_TYPE(bias->info.datatype) != CCV_QX);
+		const int bias_nd = ccv_nnc_tensor_nd(bias->info.dim);
+		// Align bias to this.
+		assert(bias_nd <= 2 || bias_nd == b_nd);
+		int i;
+		if (bias_nd == b_nd)
+		{
+			memcpy(biasdim, bias->info.dim, sizeof(biasdim));
+			if (CCV_IS_TENSOR_VIEW(bias))
+				memcpy(biasstride, bias->stride, sizeof(biasstride));
+			for (i = 0; i < bias_nd - 2; i++)
+				bias_batch_size *= biasdim[i];
+		} else if (bias_nd == 2) {
+			biasdim[0] = bias->info.dim[0];
+			for (i = 1; i < b_nd - 1; i++)
+				biasdim[i] = 1;
+			biasdim[b_nd - 1] = bias->info.dim[1];
+			if (CCV_IS_TENSOR_VIEW(bias))
+			{
+				biasstride[0] = bias->stride[0];
+				for (i = 1; i < b_nd - 1; i++)
+					biasstride[i] = biasstride[0];
+				biasstride[b_nd - 1] = bias->stride[1];
+			}
+			for (i = 0; i < bias_nd - 1; i++)
+				bias_batch_size *= biasdim[i];
+		} else {
+			for (i = 0; i < b_nd - 1; i++)
+				biasdim[i] = 1;
+			biasdim[b_nd - 1] = bias->info.dim[0];
+			if (CCV_IS_TENSOR_VIEW(bias))
+			{
+				for (i = 0; i < b_nd - 1; i++)
+					biasstride[i] = bias->info.dim[0] * bias->stride[0];
+				biasstride[b_nd - 1] = bias->stride[0];
+			}
+			for (i = 0; i < bias_nd - 1; i++)
+				bias_batch_size *= biasdim[i];
+		}
+	}
+	int* adim_r = adim;
+	int* astride_r = astride;
+	int* biasdim_r = biasdim;
+	int* biasstride_r = biasstride;
+	const int a_nd = ccv_nnc_tensor_nd(adim);
+	const int w_nd = ccv_nnc_tensor_nd(w->info.dim);
+	a_batch_size = a_nd < 3 ? 1 : adim[a_nd - 3];
+	int i;
+	for (i = 0; i < a_nd - 3; i++)
+		a_batch_size *= adim[i];
+	w_batch_size = w_nd < 3 ? 1 : w->info.dim[w_nd - 3];
+	for (i = 0; i < w_nd - 3; i++)
+		w_batch_size *= w->info.dim[i];
+	b_batch_size = b_nd < 3 ? 1 : b->info.dim[b_nd - 3];
+	for (i = 0; i < b_nd - 3; i++)
+		b_batch_size *= b->info.dim[i];
+	// Reinterpret [T, G, 1, K] x [G, N, K]^T as G batches of [T, K] x [N, K]^T.
+	const int is_interleaved_batched_gemm_shape =
+		a_nd == 4 && w_nd == 3 && b_nd == 4 &&
+		!is_transpose_a && is_transpose_w && !bias &&
+		adim[0] > 0 && adim[1] > 1 && adim[2] == 1 && adim[3] > 0 &&
+		w->info.dim[0] == adim[1] && w->info.dim[1] > 0 && w->info.dim[2] == adim[3] &&
+		b->info.dim[0] == adim[0] && b->info.dim[1] == adim[1] && b->info.dim[2] == 1 && b->info.dim[3] == w->info.dim[1] &&
+		a_rows == 1 && b_rows == 1;
+	const uint64_t interleaved_batch_count = is_interleaved_batched_gemm_shape ? (uint64_t)adim[0] * adim[1] : 0;
+	const uint64_t interleaved_a_leading_dimension = is_interleaved_batched_gemm_shape ? (uint64_t)adim[1] * adim[3] : 0;
+	const uint64_t interleaved_w_batch_stride = is_interleaved_batched_gemm_shape ? (uint64_t)w->info.dim[1] * w->info.dim[2] : 0;
+	const uint64_t interleaved_c_leading_dimension = is_interleaved_batched_gemm_shape ? (uint64_t)adim[1] * b->info.dim[3] : 0;
+	const int is_interleaved_batched_gemm =
+		is_interleaved_batched_gemm_shape &&
+		interleaved_batch_count <= INT_MAX &&
+		a_batch_size == (int)interleaved_batch_count && w_batch_size == adim[1] && b_batch_size == (int)interleaved_batch_count &&
+		interleaved_a_leading_dimension <= UINT32_MAX &&
+		interleaved_w_batch_stride <= UINT32_MAX &&
+		interleaved_c_leading_dimension <= UINT32_MAX;
+	if (a_batch_size == 1 && b_batch_size > 1)
+		a_batch_inc = 0;
+	if (w_batch_size == 1 && b_batch_size > 1)
+		w_batch_inc = 0;
+	@autoreleasepool {
+		int a_batch_stride = 0;
+		if (a_nd >= 3)
+		{
+			// Temporarily compact the batch stride for custom GEMM kernels.
+			a_batch_stride = astride[a_nd - 3];
+			// Only fake it if it is larger than the expected compact stride.
+			if (a_batch_stride > astride[a_nd - 2] * adim[a_nd - 2])
+				astride[a_nd - 3] = astride[a_nd - 2] * adim[a_nd - 2];
+		}
+		int b_batch_stride = 0;
+		if (b_nd >= 3)
+		{
+			b_batch_stride = bstride[b_nd - 3];
+			// Only fake it if it is larger than the expected compact stride.
+			if (b_batch_stride > bstride[b_nd - 2] * b->info.dim[b_nd - 2])
+				bstride[b_nd - 3] = bstride[b_nd - 2] * b->info.dim[b_nd - 2];
+		}
+		const int is_contiguous =
+			(!CCV_IS_TENSOR_VIEW(a) || ccv_nnc_tensor_view_is_contiguous(adim, astride)) &&
+			(!CCV_IS_TENSOR_VIEW(w) || ccv_nnc_tensor_view_is_contiguous(w->info.dim, w->stride)) &&
+			(!CCV_IS_TENSOR_VIEW(b) || ccv_nnc_tensor_view_is_contiguous(b->info.dim, bstride)) &&
+			(bias ? (!CCV_IS_TENSOR_VIEW(bias) || ccv_nnc_tensor_view_is_contiguous(bias->info.dim, bias->stride)) : 1);
+		if (a_nd >= 3)
+			astride[a_nd - 3] = a_batch_stride;
+		if (b_nd >= 3)
+			bstride[b_nd - 3] = b_batch_stride;
+
+		const int a_datatype = CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX ? ((a->info.datatype & 0xff) << 12) : a->info.datatype;
+		const int w_datatype = CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX ? ((w->info.datatype & 0xff) << 12) : w->info.datatype;
+		const int a_qx_subtype = CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX ? (a->info.datatype & 0xf00) : 0;
+		const int w_qx_subtype = CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX ? (w->info.datatype & 0xf00) : 0;
+		const int w_qx_8i_rowwise = (w_qx_subtype == CCV_NNC_QX_8I_ROWWISE || w_qx_subtype == CCV_NNC_QX_8I_ROWWISE_X);
+		const uint32_t w_8i_rowwise_x_flags = w_qx_subtype == CCV_NNC_QX_8I_ROWWISE_X ? (uint32_t)w->info.reserved : 0;
+		const int activation_hadamard_256 = !!(w_8i_rowwise_x_flags & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256);
+		const uint32_t w_8i_rowwise_x_format = w_8i_rowwise_x_flags & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
+		if (activation_hadamard_256 && (w->info.dim[w_nd - 1] <= 0 || w->info.dim[w_nd - 1] % 256 != 0))
+			return CCV_NNC_EXEC_INVALID;
+		const int is_same_dtype =
+			(a_datatype == w_datatype) &&
+			(a_datatype == b->info.datatype) &&
+			(bias ? (a_datatype == bias->info.datatype) : 1);
+		const int is_interleaved_batched_dense_gemm =
+			is_interleaved_batched_gemm &&
+			CCV_GET_DATA_TYPE(a->info.datatype) != CCV_QX &&
+			CCV_GET_DATA_TYPE(w->info.datatype) != CCV_QX &&
+			CCV_GET_DATA_TYPE(b->info.datatype) != CCV_QX;
+		const int is_interleaved_batched_dense_gemv =
+			is_interleaved_batched_dense_gemm && adim[0] == 1;
+		const int is_interleaved_batched_scaled_gemm =
+			is_interleaved_batched_gemm &&
+			CCV_GET_DATA_TYPE(a->info.datatype) != CCV_QX &&
+			w_qx_8i_rowwise &&
+			CCV_GET_DATA_TYPE(b->info.datatype) != CCV_QX;
+		const uint64_t interleaved_scaled_gemv_w_batch_payload_bits =
+			is_interleaved_batched_scaled_gemm && w_8i_rowwise_x_format ?
+			(uint64_t)w_cols * (((uint64_t)w_rows + ccv_nnc_8i_rowwise_x_group_size(w_8i_rowwise_x_format) - 1) / ccv_nnc_8i_rowwise_x_group_size(w_8i_rowwise_x_format)) * ccv_nnc_8i_rowwise_x_group_bits(w_8i_rowwise_x_format) : 0;
+		const uint64_t interleaved_scaled_gemv_w_batch_stride = w_8i_rowwise_x_format ?
+			(interleaved_scaled_gemv_w_batch_payload_bits + 7) / 8 : interleaved_w_batch_stride;
+		const int is_interleaved_batched_scaled_gemv =
+			is_interleaved_batched_scaled_gemm && adim[0] == 1 &&
+			(!w_8i_rowwise_x_format || (interleaved_scaled_gemv_w_batch_payload_bits % 8) == 0) &&
+			interleaved_scaled_gemv_w_batch_stride <= UINT32_MAX;
+
+		int is_supported_dtype = 0;
+		uint32_t mtl_data_type = UINT32_MAX;
+		switch (a_datatype) {
+			case CCV_16F: {
+				is_supported_dtype = 1;
+				mtl_data_type = 16;
+				break;
+			}
+			case CCV_16BF: {
+				is_supported_dtype = 1;
+				mtl_data_type = 121;
+				break;
+			}
+			case CCV_32F: {
+				is_supported_dtype = 1;
+				mtl_data_type = 3;
+				break;
+			}
+			default: {
+				break;
+			}
+		}
+
+		const int is_same_batch =
+			(a_batch_size == w_batch_size) &&
+			(a_batch_size == b_batch_size);
+
+		// NNC uses the convention B = A * W.
+		// MFA uses the convention C = A * B.
+		int is_batched = 0;
+		int is_mfa_compatible_batch = 0;
+		int A_batch_size = a_batch_size;
+		int B_batch_size = w_batch_size;
+		int C_batch_size = b_batch_size;
+		if (A_batch_size == 1 && B_batch_size == 1 && C_batch_size == 1) {
+			// Not batched.
+		} else if (A_batch_size <= 0 || B_batch_size <= 0 || C_batch_size <= 0) {
+			// Invalid batch size.
+		} else {
+			// This does not check whether the D batch size matches the others. If it
+			// does not match, it will crash when encoding the GEMM command.
+			is_batched = 1;
+			if (A_batch_size == C_batch_size) {
+				if (A_batch_size == B_batch_size) {
+					is_mfa_compatible_batch = 1;
+				} else if (B_batch_size == 1) {
+					is_mfa_compatible_batch = 1;
+				}
+			}
+		}
+		const int is_ane_rowwise_compatible_batch = is_mfa_compatible_batch && B_batch_size == 1;
+
+		ccv_nnc_mfa_context_t* context = ccv_nnc_default_mfa_context();
+		const int load_m = !!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_GEMM_SPECIALIZING_M);
+		const int is_mfa_gemv =
+			(!is_batched && ((((a_rows == 1) || (!is_transpose_a && (a_rows == 2 || a_rows == 3))) && is_transpose_w && (w_rows % 4) == 0) || (!is_transpose_a && w_cols == 1 && (a_cols % 4) == 0))) ||
+			(is_interleaved_batched_dense_gemv && (w_rows % 4) == 0);
+		const int is_downcast = ((cmd.info.blas.flags & CCV_NNC_GEMM_16F) && (a_datatype == CCV_16F || a_datatype == CCV_16BF));
+		const int use_ane_rowwise_gemm =
+			w_qx_8i_rowwise &&
+			(!activation_hadamard_256 || w_rows <= 65536) &&
+			(a_datatype == CCV_16F || a_datatype == CCV_16BF || a_datatype == CCV_32F) &&
+			(!bias || bias_batch_size == 1) &&
+			(CCV_GET_DATA_TYPE(a->info.datatype) != CCV_QX) &&
+			(!is_transpose_a) &&
+			is_transpose_w &&
+			is_contiguous &&
+			is_same_dtype &&
+			is_supported_dtype &&
+			(!is_batched || is_ane_rowwise_compatible_batch) &&
+			ccv_nnc_mfa_context_supported(context) &&
+			ccv_nnc_mfa_supports_int8_ane(context) &&
+			!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA) &&
+			!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_ANE);
+		const int use_neural_accelerators =
+			!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_NEURAL_ACCELERATORS) &&
+			ccv_nnc_mfa_has_neural_accelerators(context) &&
+			(mtl_data_type != 121 || ccv_nnc_mfa_neural_accelerators_support_bfloat(context));
+		// Without neural accelerators, FP16 activations and fused bias need
+		// Int8MatMul, which reduces K in multiples of 8.
+		const int use_int8_matmul = (w_rows % 8) == 0 && ccv_nnc_mfa_supports_int8_matmul(context, b_rows, b_cols);
+		const int use_scaled_gemm_without_neural_accelerators =
+			!use_neural_accelerators &&
+			w_qx_8i_rowwise &&
+			(a_datatype == CCV_32F || (a_datatype == CCV_16F && use_int8_matmul)) &&
+			(!bias || (use_int8_matmul && bias_batch_size == 1)) &&
+			a_rows > 3 &&
+			!is_batched &&
+			ccv_nnc_tensor_count(a->info) <= UINT32_MAX &&
+			ccv_nnc_tensor_count(w->info) <= UINT32_MAX &&
+			ccv_nnc_tensor_count(b->info) <= UINT32_MAX;
+		const int use_scaled_gemm =
+			w_qx_8i_rowwise &&
+			(!activation_hadamard_256 || w_rows <= 65536) &&
+			(CCV_GET_DATA_TYPE(a->info.datatype) != CCV_QX) &&
+			(CCV_GET_DATA_TYPE(b->info.datatype) != CCV_QX) &&
+			(!bias || CCV_GET_DATA_TYPE(bias->info.datatype) != CCV_QX) &&
+			!is_transpose_a &&
+			is_transpose_w &&
+			is_contiguous &&
+			is_same_dtype &&
+			is_supported_dtype &&
+			(!is_batched || is_mfa_compatible_batch || is_interleaved_batched_scaled_gemm) &&
+			(!bias || bias_batch_size == 1 || bias_batch_size == b_batch_size) &&
+			ccv_nnc_mfa_context_supported(context) &&
+			!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA) &&
+			!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_GEMM) &&
+			(use_neural_accelerators || use_scaled_gemm_without_neural_accelerators);
+		const int use_scaled_gemv =
+			!activation_hadamard_256 &&
+			w_qx_8i_rowwise &&
+			(CCV_GET_DATA_TYPE(a->info.datatype) != CCV_QX) &&
+			(CCV_GET_DATA_TYPE(b->info.datatype) != CCV_QX) &&
+			(!bias || CCV_GET_DATA_TYPE(bias->info.datatype) != CCV_QX) &&
+			(a_rows == 1 || a_rows == 2 || a_rows == 3) &&
+			!is_transpose_a &&
+			is_transpose_w &&
+			(w_rows % 4) == 0 &&
+			(!w_8i_rowwise_x_format || ((w_rows % 256) == 0 && (w_cols % 256) == 0)) &&
+			(!is_batched || is_interleaved_batched_scaled_gemv) &&
+			is_contiguous &&
+			is_same_dtype &&
+			is_supported_dtype &&
+			(!bias || bias_batch_size == 1) &&
+			ccv_nnc_mfa_context_supported(context) &&
+			!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA);
+		// Generic MFA decodes row-wise weights before applying the interleaved strides.
+		const int is_interleaved_batched_mfa_gemm =
+			is_interleaved_batched_dense_gemm ||
+			(!use_neural_accelerators && is_interleaved_batched_scaled_gemm);
+		const int is_mfa_supported =
+			ccv_nnc_mfa_context_supported(context) && is_contiguous && is_same_dtype && is_supported_dtype && (!is_batched || is_mfa_compatible_batch || is_interleaved_batched_mfa_gemm) && !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA) && (is_mfa_gemv || !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_GEMM));
+
+		size_t a_data_size = 0;
+		if (CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX && ((a_qx_subtype >= 0x400 && a_qx_subtype <= 0x800) || a_qx_subtype == CCV_NNC_QX_8I_ROWWISE || a_qx_subtype == CCV_NNC_QX_8I_ROWWISE_X))
+			a_data_size = _ccv_nnc_qx_fp_data_size(a->info);
+		size_t w_data_size = 0;
+		if (CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX && ((w_qx_subtype >= 0x400 && w_qx_subtype <= 0x800) || w_qx_subtype == CCV_NNC_QX_8I_ROWWISE || w_qx_subtype == CCV_NNC_QX_8I_ROWWISE_X))
+			w_data_size = _ccv_nnc_qx_fp_data_size(w->info);
+		const uint32_t w_8i_rowwise_rows = (uint32_t)((size_t)(w_batch_size > 1 ? (is_interleaved_batched_scaled_gemm ? w_batch_size : b_batch_size) : 1) * b_cols);
+		const uint32_t w_8i_rowwise_cols = (uint32_t)w_rows;
+		const size_t w_8i_rowwise_data_size = w_8i_rowwise_x_format ? _ccv_nnc_8i_rowwise_data_size(w_8i_rowwise_rows, w_8i_rowwise_cols, w_datatype) : 0;
+
+		if (use_scaled_gemv)
+		{
+			ccv_nnc_mfa_scaled_gemv_params_t params = {
+				.data_type = mtl_data_type,
+				.format = w_8i_rowwise_x_format,
+				.mrows = (uint32_t)a_rows,
+				.ncols = (uint32_t)w_rows,
+				.nrows = (uint32_t)w_cols,
+				.batch_dimension = is_interleaved_batched_scaled_gemv ? (uint32_t)adim[1] : 0,
+				.batch_stride_weights = is_interleaved_batched_scaled_gemv ? (uint32_t)interleaved_scaled_gemv_w_batch_stride : 0,
+				.batch_stride_vector = is_interleaved_batched_scaled_gemv ? (uint32_t)w_rows : 0,
+				.batch_stride_output = is_interleaved_batched_scaled_gemv ? (uint32_t)b_cols : 0,
+				.batch_stride_scale = is_interleaved_batched_scaled_gemv ? (uint32_t)b_cols : 0,
+				.fused_bias = bias ? 1 : 0,
+			};
+			ccv_nnc_mfa_prepare_scaled_gemv(context, params);
+			mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+			mtl_buffer_t* bias_buffer = NULL;
+			if (bias)
+				bias_buffer = mpgetbuffer((ccv_nnc_tensor_t*)bias);
+			mtl_buffer_t* tensors[5] = {
+				mpgetbuffer((ccv_nnc_tensor_t*)w),
+				mpgetbuffer((ccv_nnc_tensor_t*)a),
+				mpgetbuffer((ccv_nnc_tensor_t*)b),
+				bias_buffer,
+				NULL,
+			};
+			size_t tensor_offsets[4] = {
+				w->dataof,
+				a->dataof,
+				b->dataof,
+				bias ? bias->dataof : 0,
+			};
+			ccv_nnc_mfa_encode_scaled_gemv(context, params, command_batch, tensors, tensor_offsets);
+			ccv_nnc_stream_context_finish_command_batch(stream_context, command_batch);
+			return CCV_NNC_EXEC_SUCCESS;
+		}
+
+		// Rowwise int8 GEMM prefers splitting rows between the ANE and the GPU, then
+		// the ANE alone, then the GPU alone (neural accelerators or Int8MatMul). The
+		// split compares predicted times, and may choose the GPU or the ANE alone.
+		const ccv_nnc_mfa_ane_na_rowwise_gemm_params_t ane_and_gpu_params = {
+			.data_type = mtl_data_type,
+			.M = (uint32_t)b_rows,
+			.N = (uint32_t)b_cols,
+			.K = (uint32_t)w_rows,
+			.fused_bias = (bias ? 1 : 0),
+			.activation_hadamard_256 = activation_hadamard_256,
+			.use_neural_accelerators = use_neural_accelerators,
+			.batch_dimension = b_batch_size,
+			.batch_stride_a = a_batch_size > 1 ? ccv_max(a_batch_stride, b_rows * w_rows) : 0,
+			.batch_stride_b = w_batch_size > 1 ? b_cols * w_rows : 0,
+			.batch_stride_c = b_batch_size > 1 ? ccv_max(b_batch_stride, b_rows * b_cols) : 0,
+			.batch_stride_d = bias_batch_size > 1 ? b_cols : 0,
+		};
+		// Without neural accelerators the GPU rows run Int8MatMul, whose limits the
+		// split checks itself; the GPU alone may still dequantize for GEMM instead.
+		uint32_t ane_and_gpu_ane_rows = 0;
+		const int use_ane_and_gpu_rowwise_gemm =
+			use_ane_rowwise_gemm &&
+			(use_neural_accelerators ? use_scaled_gemm : (!is_batched && !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_GEMM))) &&
+			!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_ANE_AND_GPU) &&
+			ccv_nnc_mfa_choose_ane_na_rowwise_split_rows_per_batch(context, ane_and_gpu_params, &ane_and_gpu_ane_rows);
+		if (use_ane_and_gpu_rowwise_gemm && ane_and_gpu_ane_rows > 0 && ane_and_gpu_ane_rows < ane_and_gpu_params.M)
+		{
+			const size_t scratch_offset = ccv_nnc_mfa_ane_na_rowwise_split_gemm_reserved_scratch_size(context, ane_and_gpu_params);
+			mtl_buffer_t* w_data = mpgetbuffer((ccv_nnc_tensor_t*)w);
+			size_t w_dataof = w->dataof;
+			if (w_8i_rowwise_x_format)
+			{
+				mtl_buffer_t* const scratch = ccv_nnc_mfa_request_scratch(context, scratch_offset + w_8i_rowwise_data_size);
+				ccv_nnc_mfa_dequantize_8i_rowwise_x_params_t w_decode_params = _ccv_nnc_8i_rowwise_x_decode_params(mtl_data_type, w_8i_rowwise_x_format, w_8i_rowwise_rows, w_8i_rowwise_cols);
+				ccv_nnc_mfa_prepare_dequantize_8i_rowwise_x(context, w_decode_params);
+				mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+				_ccv_nnc_mfa_encode_8i_rowwise_x_decode(context, w_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)w), w->dataof, scratch, scratch_offset);
+				ccv_nnc_stream_context_finish_command_batch(stream_context, command_batch);
+				w_data = scratch;
+				w_dataof = scratch_offset;
+			}
+			mtl_buffer_t* tensors[4] = {
+				mpgetbuffer((ccv_nnc_tensor_t*)a),
+				w_data,
+				mpgetbuffer((ccv_nnc_tensor_t*)b),
+				bias ? mpgetbuffer((ccv_nnc_tensor_t*)bias) : nil,
+			};
+			size_t tensor_offsets[4] = {
+				a->dataof,
+				w_dataof,
+				b->dataof,
+				bias ? bias->dataof : 0,
+			};
+			const int status = ccv_nnc_mfa_run_ane_na_rowwise_split_gemm(context, ane_and_gpu_params, ane_and_gpu_ane_rows, tensors, tensor_offsets, stream_context);
+			if (status > 0)
+			{
+				if (METAL_LOG_LEVEL(context) >= 1)
+					ccv_nnc_mfa_log_message("Using hybrid ANE + GPU rowwise GEMM.");
+				return CCV_NNC_EXEC_SUCCESS;
+			}
+			if (status < 0)
+				return CCV_NNC_EXEC_INVALID;
+		}
+
+		const int use_ane_alone_rowwise_gemm =
+			use_ane_rowwise_gemm && !(use_ane_and_gpu_rowwise_gemm && ane_and_gpu_ane_rows == 0);
+		if (use_ane_alone_rowwise_gemm)
+		{
+			ccv_nnc_mfa_ane_rowwise_gemm_params_t params = {
+				.M = (uint32_t)b_rows,
+				.N = (uint32_t)b_cols,
+				.K = (uint32_t)w_rows,
+				.data_type = mtl_data_type,
+				.fused_bias = bias ? 1 : 0,
+				.activation_hadamard_256 = activation_hadamard_256,
+				.batch_dimension = (uint32_t)C_batch_size,
+				.batch_stride_a = a_batch_size > 1 ? (uint32_t)ccv_max(a_batch_stride, b_rows * w_rows) : 0,
+				.batch_stride_c = b_batch_size > 1 ? (uint32_t)ccv_max(b_batch_stride, b_rows * b_cols) : 0,
+			};
+			const size_t scratch_offset = ccv_nnc_mfa_ane_rowwise_gemm_reserved_scratch_size(params);
+			mtl_buffer_t* w_data = mpgetbuffer((ccv_nnc_tensor_t*)w);
+			size_t w_dataof = w->dataof;
+			if (w_8i_rowwise_x_format)
+			{
+				mtl_buffer_t* const scratch = ccv_nnc_mfa_request_scratch(context, scratch_offset + w_8i_rowwise_data_size);
+				ccv_nnc_mfa_dequantize_8i_rowwise_x_params_t w_decode_params = _ccv_nnc_8i_rowwise_x_decode_params(mtl_data_type, w_8i_rowwise_x_format, w_8i_rowwise_rows, w_8i_rowwise_cols);
+				ccv_nnc_mfa_prepare_dequantize_8i_rowwise_x(context, w_decode_params);
+				mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+				_ccv_nnc_mfa_encode_8i_rowwise_x_decode(context, w_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)w), w->dataof, scratch, scratch_offset);
+				ccv_nnc_stream_context_finish_command_batch(stream_context, command_batch);
+				w_data = scratch;
+				w_dataof = scratch_offset;
+			}
+			mtl_buffer_t* tensors[4] = {
+				mpgetbuffer((ccv_nnc_tensor_t*)a),
+				w_data,
+				mpgetbuffer((ccv_nnc_tensor_t*)b),
+				bias ? mpgetbuffer((ccv_nnc_tensor_t*)bias) : nil,
+			};
+			size_t tensor_offsets[4] = {
+				a->dataof,
+				w_dataof,
+				b->dataof,
+				bias ? bias->dataof : 0,
+			};
+			if (ccv_nnc_mfa_run_ane_rowwise_gemm(context, params, tensors, tensor_offsets, stream_context))
+			{
+				if (METAL_LOG_LEVEL(context) >= 1)
+					ccv_nnc_mfa_log_message("Using ANE rowwise GEMM.");
+				return CCV_NNC_EXEC_SUCCESS;
+			}
+		}
+
+		// If ANE declines, dense fallback reconstructs logical weights by fusing
+		// inverse H256 into packed-to-float decoding. Scaled GEMM instead keeps
+		// the rotated INT8 weights and transforms the activations.
+
+		if (use_scaled_gemm)
+		{
+			ccv_nnc_mfa_scaled_gemm_params_t params = {
+				.data_type = mtl_data_type,
+				.M = (uint32_t)(is_interleaved_batched_scaled_gemm ? adim[0] : b_rows),
+				.N = (uint32_t)b_cols,
+				.K = (uint32_t)w_rows,
+				.fused_bias = (bias ? 1 : 0),
+				.use_neural_accelerators = use_neural_accelerators,
+				.activation_hadamard_256 = activation_hadamard_256,
+				.batch_dimension = is_interleaved_batched_scaled_gemm ? (uint32_t)adim[1] : b_batch_size,
+				.batch_stride_a = is_interleaved_batched_scaled_gemm ? (uint32_t)w_rows : (a_batch_size > 1 ? ccv_max(a_batch_stride, b_rows * w_rows) : 0),
+				.batch_stride_b = is_interleaved_batched_scaled_gemm ? (uint32_t)interleaved_w_batch_stride : (w_batch_size > 1 ? b_cols * w_rows : 0),
+				.batch_stride_c = is_interleaved_batched_scaled_gemm ? (uint32_t)b_cols : (b_batch_size > 1 ? ccv_max(b_batch_stride, b_rows * b_cols) : 0),
+				.batch_stride_d = bias_batch_size > 1 ? b_cols : 0,
+				.leading_dimension_a = is_interleaved_batched_scaled_gemm ? (uint32_t)interleaved_a_leading_dimension : 0,
+				.leading_dimension_c = is_interleaved_batched_scaled_gemm ? (uint32_t)interleaved_c_leading_dimension : 0,
+				.loadM = load_m,
+			};
+			ccv_nnc_mfa_prepare_scaled_gemm(context, params);
+			const size_t scratch_offset = ccv_nnc_mfa_scaled_gemm_reserved_scratch_size(context, params);
+			mtl_buffer_t* w_data = mpgetbuffer((ccv_nnc_tensor_t*)w);
+			size_t w_dataof = w->dataof;
+			ccv_nnc_mfa_dequantize_8i_rowwise_x_params_t w_decode_params;
+			mtl_buffer_t* scratch = 0;
+			if (w_8i_rowwise_x_format)
+			{
+				scratch = ccv_nnc_mfa_request_scratch(context, scratch_offset + w_8i_rowwise_data_size);
+				w_decode_params = _ccv_nnc_8i_rowwise_x_decode_params(mtl_data_type, w_8i_rowwise_x_format, w_8i_rowwise_rows, w_8i_rowwise_cols);
+				ccv_nnc_mfa_prepare_dequantize_8i_rowwise_x(context, w_decode_params);
+				w_data = scratch;
+				w_dataof = scratch_offset;
+			}
+			mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+			if (w_8i_rowwise_x_format)
+				_ccv_nnc_mfa_encode_8i_rowwise_x_decode(context, w_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)w), w->dataof, scratch, scratch_offset);
+			mtl_buffer_t* bias_buffer = NULL;
+			if (bias)
+				bias_buffer = mpgetbuffer((ccv_nnc_tensor_t*)bias);
+			mtl_buffer_t* tensors[5] = {
+				mpgetbuffer((ccv_nnc_tensor_t*)a),
+				w_data,
+				mpgetbuffer((ccv_nnc_tensor_t*)b),
+				bias_buffer,
+				NULL,
+			};
+			size_t tensor_offsets[4] = {
+				a->dataof,
+				w_dataof,
+				b->dataof,
+				bias ? bias->dataof : 0,
+			};
+			ccv_nnc_mfa_encode_scaled_gemm(context, params, command_batch, tensors, tensor_offsets);
+			ccv_nnc_stream_context_finish_command_batch(stream_context, command_batch);
+			return CCV_NNC_EXEC_SUCCESS;
+		}
+
+		if (METAL_LOG_LEVEL(context) >= 3)
+		{
+			if (is_mfa_supported)
+			{
+				ccv_nnc_mfa_log_message("Compatible GEMM found.");
+			} else {
+				ccv_nnc_mfa_log_message("Incompatible GEMM found. Incompatible because:");
+				if (!is_contiguous)
+				{
+					ccv_nnc_mfa_log_message("  Strided.");
+				}
+				if (!is_same_dtype)
+				{
+					ccv_nnc_mfa_log_message("  Mixed precision.");
+				}
+				if (!is_same_dtype)
+				{
+					ccv_nnc_mfa_log_message("  Unsupported data type.");
+				}
+				if (is_batched && !is_mfa_compatible_batch && !is_interleaved_batched_mfa_gemm)
+				{
+					ccv_nnc_mfa_log_message("  Unsupported batch.");
+				}
+			}
+		}
+
+		if (is_mfa_supported)
+		{
+			// On supported devices, use Metal directly.
+			ccv_nnc_mfa_gemm_params_t params = {
+				.data_type = mtl_data_type,
+				.M = (uint32_t)(is_interleaved_batched_mfa_gemm ? adim[0] : b_rows), // C_rows
+				.N = (uint32_t)b_cols, // C_cols
+				.K = (uint32_t)w_rows, // B_rows
+				.A_trans = (is_transpose_a ? 1 : 0),
+				.B_trans = (is_transpose_w ? 1 : 0),
+				.D_trans = 0,
+				.fused_bias = (bias ? 1 : 0),
+				.register_float = (is_downcast ? 0 : 1),
+				.use_neural_accelerators = use_neural_accelerators,
+
+				.batch_dimension = (uint32_t)(is_interleaved_batched_mfa_gemm ? adim[1] : b_batch_size),
+				.batch_stride_a = is_interleaved_batched_mfa_gemm ? (uint32_t)w_rows : (a_batch_size > 1 ? ccv_max(a_batch_stride, b_rows * w_rows) : 0),
+				.batch_stride_b = is_interleaved_batched_mfa_gemm ? (uint32_t)interleaved_w_batch_stride : (w_batch_size > 1 ? b_cols * w_rows : 0),
+				.batch_stride_c = is_interleaved_batched_mfa_gemm ? (uint32_t)b_cols : (b_batch_size > 1 ? ccv_max(b_batch_stride, b_rows * b_cols) : 0),
+				.batch_stride_d = bias_batch_size > 1 ? b_cols : 0,
+				.leading_dimension_a = is_interleaved_batched_mfa_gemm ? (uint32_t)interleaved_a_leading_dimension : 0,
+				.leading_dimension_c = is_interleaved_batched_mfa_gemm ? (uint32_t)interleaved_c_leading_dimension : 0,
+				.loadM = load_m && !is_transpose_a,
+			};
+			mtl_buffer_t* scratch = 0;
+			const size_t scratch_offset = ccv_nnc_mfa_gemm_reserved_scratch_size(params);
+			if (a_data_size + w_data_size > 0)
+				scratch = ccv_nnc_mfa_request_scratch(context, scratch_offset + a_data_size + w_data_size);
+			mtl_buffer_t* a_data = mpgetbuffer((ccv_nnc_tensor_t*)a);
+			size_t a_dataof = (size_t)mpgetoffset((ccv_nnc_tensor_t*)a);
+			ccv_nnc_mfa_qx_decode_params_t a_decode_params;
+			if (CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX)
+			{
+				a_decode_params = _ccv_nnc_mfa_qx_decode_params(a->info, mtl_data_type);
+				_ccv_nnc_mfa_prepare_qx_decode(context, a_decode_params);
+				a_data = scratch;
+				a_dataof = scratch_offset;
+			}
+			mtl_buffer_t* w_data = mpgetbuffer((ccv_nnc_tensor_t*)w);
+			size_t w_dataof = (size_t)mpgetoffset((ccv_nnc_tensor_t*)w);
+			ccv_nnc_mfa_qx_decode_params_t w_decode_params;
+			if (CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX)
+			{
+				w_decode_params = _ccv_nnc_mfa_qx_decode_params(w->info, mtl_data_type);
+				_ccv_nnc_mfa_prepare_qx_decode(context, w_decode_params);
+				w_data = scratch;
+				w_dataof = a_data_size + scratch_offset;
+			}
+			// Let the MFA GEMM selector choose NAMatMulSmallM for the low-K row-vector NAX window
+			// only when the caller explicitly requests the 16F downcast path.
+			const int use_mfa_gemm_for_vector =
+				!is_interleaved_batched_dense_gemv &&
+				a_rows == 1 &&
+				!is_transpose_a &&
+				is_transpose_w &&
+				(w_rows % 8) == 0 &&
+				w_rows < 5120 &&
+				is_downcast &&
+				(mtl_data_type == 16 || mtl_data_type == 121) &&
+				!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_GEMM) &&
+				params.use_neural_accelerators;
+			if (is_mfa_gemv && !use_mfa_gemm_for_vector)
+			{
+				// This is GEMV, use GEMV kernel.
+				ccv_nnc_mfa_gemv_params_t params;
+				if ((a_rows == 1 || a_rows == 2 || a_rows == 3) && is_transpose_w)
+				{
+					params = (ccv_nnc_mfa_gemv_params_t){
+						.data_type = mtl_data_type,
+						.mrows = (uint32_t)a_rows,
+						.ncols = w_rows,
+						.nrows = w_cols,
+						.batch_dimension = is_interleaved_batched_dense_gemv ? (uint32_t)adim[1] : 0,
+						.batch_stride_a = is_interleaved_batched_dense_gemv ? (uint32_t)interleaved_w_batch_stride : 0,
+						.batch_stride_b = is_interleaved_batched_dense_gemv ? (uint32_t)w_rows : 0,
+						.batch_stride_c = is_interleaved_batched_dense_gemv ? (uint32_t)b_cols : 0,
+						.fused_bias = bias ? 1 : 0,
+					};
+				} else {
+					params = (ccv_nnc_mfa_gemv_params_t){
+						.data_type = mtl_data_type,
+						.mrows = 1,
+						.ncols = a_cols,
+						.nrows = a_rows,
+						.fused_bias = bias ? 1 : 0,
+					};
+				}
+				ccv_nnc_mfa_prepare_gemv(context, params);
+
+				// Creating a new command buffer has a >10 µs penalty CPU-side. Still
+				// faster the >50 µs penalty for MPSGraph (probably why
+				// MPSMatrixMultiplication is faster for GEMM).
+				mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+				if (CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX)
+				{
+					_ccv_nnc_mfa_encode_qx_decode(context, a_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)a), a->dataof, (mtl_buffer_t*)scratch, scratch_offset);
+				}
+				if (CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX)
+				{
+					_ccv_nnc_mfa_encode_qx_decode(context, w_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)w), w->dataof, (mtl_buffer_t*)scratch, a_data_size + scratch_offset);
+				}
+				mtl_buffer_t* bias_buffer = NULL;
+				if (bias) {
+					bias_buffer = mpgetbuffer((ccv_nnc_tensor_t*)bias);
+				}
+				mtl_buffer_t* tensors[5] = {
+					NULL,
+					NULL,
+					mpgetbuffer((ccv_nnc_tensor_t*)b), // C
+					bias_buffer, // D
+					NULL,
+				};
+				size_t tensor_offsets[4] = {
+					0,
+					0,
+					b->dataof, // C offset
+					bias ? bias->dataof : 0, // D offset
+				};
+				if ((a_rows == 1 || a_rows == 2 || a_rows == 3) && is_transpose_w)
+				{
+					tensors[0] = w_data;
+					tensors[1] = a_data;
+					tensor_offsets[0] = w_dataof;
+					tensor_offsets[1] = a_dataof;
+				} else {
+					tensors[0] = a_data;
+					tensors[1] = w_data;
+					tensor_offsets[0] = a_dataof;
+					tensor_offsets[1] = w_dataof;
+				}
+				ccv_nnc_mfa_encode_gemv(context, params, command_batch, tensors, tensor_offsets);
+				ccv_nnc_stream_context_finish_command_batch(stream_context, command_batch);
+				return CCV_NNC_EXEC_SUCCESS;
+			}
+			ccv_nnc_mfa_prepare_gemm(context, params);
+
+			// Creating a new command buffer has a >10 µs penalty CPU-side. Still
+			// faster the >50 µs penalty for MPSGraph (probably why
+			// MPSMatrixMultiplication is faster for GEMM).
+			mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+			if (CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX)
+			{
+				_ccv_nnc_mfa_encode_qx_decode(context, a_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)a), a->dataof, (mtl_buffer_t*)scratch, scratch_offset);
+			}
+			if (CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX)
+			{
+				_ccv_nnc_mfa_encode_qx_decode(context, w_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)w), w->dataof, (mtl_buffer_t*)scratch, a_data_size + scratch_offset);
+			}
+			mtl_buffer_t* bias_buffer = NULL;
+			if (bias) {
+				bias_buffer = mpgetbuffer((ccv_nnc_tensor_t*)bias);
+			}
+			mtl_buffer_t* tensors[5] = {
+				a_data, // A
+				w_data, // B
+				mpgetbuffer((ccv_nnc_tensor_t*)b), // C
+				bias_buffer, // D
+				NULL,
+			};
+			size_t tensor_offsets[4] = {
+				a_dataof, // A offset
+				w_dataof, // B offset
+				b->dataof, // C offset
+				bias ? bias->dataof : 0, // D offset
+			};
+			ccv_nnc_mfa_encode_gemm(context, params, command_batch, tensors, tensor_offsets);
+			ccv_nnc_stream_context_finish_command_batch(stream_context, command_batch);
+		} else {
+			mtl_buffer_t* a_data = mpgetbuffer((ccv_nnc_tensor_t*)a);
+			size_t a_dataof = (size_t)mpgetoffset((ccv_nnc_tensor_t*)a);
+			mtl_buffer_t* w_data = mpgetbuffer((ccv_nnc_tensor_t*)w);
+			size_t w_dataof = (size_t)mpgetoffset((ccv_nnc_tensor_t*)w);
+			MPSCommandBuffer* command_buffer;
+			if (CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX || CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX)
+			{
+				mtl_buffer_t* scratch = 0;
+				if (a_data_size + w_data_size > 0)
+					scratch = ccv_nnc_mfa_request_scratch(context, a_data_size + w_data_size);
+				ccv_nnc_mfa_qx_decode_params_t a_decode_params;
+				if (CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX)
+				{
+					a_decode_params = _ccv_nnc_mfa_qx_decode_params(a->info, mtl_data_type);
+					_ccv_nnc_mfa_prepare_qx_decode(context, a_decode_params);
+					a_data = scratch;
+					a_dataof = 0;
+				}
+				ccv_nnc_mfa_qx_decode_params_t w_decode_params;
+				if (CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX)
+				{
+					w_decode_params = _ccv_nnc_mfa_qx_decode_params(w->info, mtl_data_type);
+					_ccv_nnc_mfa_prepare_qx_decode(context, w_decode_params);
+					w_data = scratch;
+					w_dataof = a_data_size;
+				}
+				mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+				if (CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX)
+				{
+					_ccv_nnc_mfa_encode_qx_decode(context, a_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)a), a->dataof, (mtl_buffer_t*)scratch, 0);
+				}
+				if (CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX)
+				{
+					_ccv_nnc_mfa_encode_qx_decode(context, w_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)w), w->dataof, (mtl_buffer_t*)scratch, a_data_size);
+				}
+				command_buffer = ccv_nnc_stream_context_finish_command_batch_encoding_and_return_mps_command_buffer(stream_context, command_batch);
+			} else // Otherwise, incur the ~10-50 microsecond latency of MPS.
+				command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+
+			// If all conditions are met, use MPSMatrixMultiplication. Note that the bias only supported for Float32 and this has to be added because MPSGraph on Float32 won't do the computation properly on Intel.
+			// MPSMatrixMultiplication does not support BF16. A single bias vector
+			// limits MPSMatrixNeuron to one matrix; use MPSGraph for batched bias.
+			if (is_contiguous && is_same_dtype && is_same_batch && a_datatype != CCV_16BF && !(ccv_nnc_flags() & CCV_NNC_DISABLE_MIXED_MPS_GEMM) && (!bias || (bias->info.datatype == CCV_32F && b_batch_size == 1)))
+			{
+				id<MTLBuffer> a_buffer = (id<MTLBuffer>)a_data;
+				MPSMatrix* leftMatrix = [[MPSMatrix alloc] initWithBuffer:a_buffer offset:a_dataof descriptor:[MPSMatrixDescriptor matrixDescriptorWithRows:(is_transpose_a ? a_cols : a_rows) columns:(is_transpose_a ? a_rows : a_cols) matrices:b_batch_size rowBytes:CCV_GET_DATA_TYPE_SIZE(a_datatype) * (is_transpose_a ? a_cols_inc : a_rows_inc) matrixBytes:CCV_GET_DATA_TYPE_SIZE(a_datatype) * a_batch_inc dataType:ccv_nnc_mps_datatype(a->info.datatype)]];
+				id<MTLBuffer> w_buffer = (id<MTLBuffer>)w_data;
+				MPSMatrix* rightMatrix = [[MPSMatrix alloc] initWithBuffer:w_buffer offset:w_dataof descriptor:[MPSMatrixDescriptor matrixDescriptorWithRows:(is_transpose_w ? w_cols : w_rows) columns:(is_transpose_w ? w_rows : w_cols) matrices:b_batch_size rowBytes:CCV_GET_DATA_TYPE_SIZE(w_datatype) * (is_transpose_w ? w_cols_inc : w_rows_inc) matrixBytes:CCV_GET_DATA_TYPE_SIZE(w_datatype) * w_batch_inc dataType:ccv_nnc_mps_datatype(w->info.datatype)]];
+				id<MTLBuffer> b_buffer = mpgetbuffer((ccv_nnc_tensor_t*)b);
+				MPSMatrix* resultMatrix = [[MPSMatrix alloc] initWithBuffer:b_buffer offset:b->dataof descriptor:[MPSMatrixDescriptor matrixDescriptorWithRows:b_rows columns:b_cols matrices:b_batch_size rowBytes:CCV_GET_DATA_TYPE_SIZE(b->info.datatype) * b_rows_inc matrixBytes:CCV_GET_DATA_TYPE_SIZE(b->info.datatype) * b_batch_inc dataType:ccv_nnc_mps_datatype(b->info.datatype)]];
+				MPSMatrixMultiplication* matrixMultiplication = [[MPSMatrixMultiplication alloc] initWithDevice:ccv_nnc_default_device() transposeLeft:(is_transpose_a ? YES : NO) transposeRight:(is_transpose_w ? YES : NO) resultRows:b_rows resultColumns:b_cols interiorColumns:a_cols alpha:1 beta:0];
+				[leftMatrix synchronizeOnCommandBuffer:command_buffer];
+				[rightMatrix synchronizeOnCommandBuffer:command_buffer];
+				[matrixMultiplication encodeToCommandBuffer:command_buffer leftMatrix:leftMatrix rightMatrix:rightMatrix resultMatrix:resultMatrix];
+				[resultMatrix synchronizeOnCommandBuffer:command_buffer];
+				[matrixMultiplication release];
+				[leftMatrix release];
+				[rightMatrix release];
+				if (bias)
+				{
+					id<MTLBuffer> bias_buffer = mpgetbuffer((ccv_nnc_tensor_t*)bias);
+					size_t bias_dataof = (size_t)mpgetoffset((ccv_nnc_tensor_t*)bias);
+					MPSVector* biasVector = [[MPSVector alloc] initWithBuffer:bias_buffer offset:bias_dataof descriptor:[MPSVectorDescriptor vectorDescriptorWithLength:ccv_nnc_tensor_count(bias->info) dataType:ccv_nnc_mps_datatype(bias->info.datatype)]];
+					[biasVector synchronizeOnCommandBuffer:command_buffer];
+					MPSMatrixNeuron* biasAdd = [[MPSMatrixNeuron alloc] initWithDevice:ccv_nnc_default_device()];
+					[biasAdd encodeToCommandBuffer:command_buffer inputMatrix:resultMatrix biasVector:biasVector resultMatrix:resultMatrix];
+					[biasVector synchronizeOnCommandBuffer:command_buffer];
+					[biasAdd release];
+					[biasVector release];
+				}
+				[resultMatrix release];
+			} else {
+				// Otherwise, use MPSGraph.
+				ccv_nnc_mps_graph_key_t key = ccv_nnc_mps_graph_key_new(cmd, 0, hint, flags, inputs, input_size, outputs, output_size);
+				// Key will be consumed by the next method, therefore, no need to free.
+				int indices[3];
+				MPSGraphExecutable* executable = ccv_nnc_mps_graph_executable_cache(key, indices, ^void (MPSGraph* graph, NSMutableArray<MPSGraphTensor*>* inputTensors, NSMutableArray<MPSGraphShapedType*>* inputShapedTypes, NSMutableArray<MPSGraphTensor*>* resultTensors) {
+					MPSGraphTensor* mps_input_a;
+					MPSGraphTensor* mps_a = ccv_nnc_mps_graph_tensor_input(graph, a, adim_r, astride_r, &mps_input_a);
+					MPSGraphTensor* mps_input_w;
+					MPSGraphTensor* mps_w = ccv_nnc_mps_graph_tensor_input(graph, w, w->info.dim, w->stride, &mps_input_w);
+					MPSGraphShapedType* mps_a_shape = ccv_nnc_mps_graph_tensor_input_shape(a, adim_r, astride_r);
+					MPSGraphShapedType* mps_w_shape = ccv_nnc_mps_graph_tensor_input_shape(w, w->info.dim, w->stride);
+					if (is_transpose_a)
+						mps_a = [graph transposeTensor:mps_a dimension:-2 withDimension:-1 name:nil];
+					if (is_transpose_w)
+						mps_w = [graph transposeTensor:mps_w dimension:-2 withDimension:-1 name:nil];
+					MPSGraphTensor* mps_b = [graph matrixMultiplicationWithPrimaryTensor:mps_a secondaryTensor:mps_w name:nil];
+					[inputTensors addObject:mps_input_a];
+					[inputShapedTypes addObject:mps_a_shape];
+					[inputTensors addObject:mps_input_w];
+					[inputShapedTypes addObject:mps_w_shape];
+					if (bias)
+					{
+						MPSGraphTensor* mps_input_bias;
+						MPSGraphTensor* mps_bias = ccv_nnc_mps_graph_tensor_input(graph, bias, biasdim_r, biasstride_r, &mps_input_bias);
+						MPSGraphShapedType* mps_bias_shape = ccv_nnc_mps_graph_tensor_input_shape(bias, biasdim_r, biasstride_r);
+						// Add support broadcast directly.
+						mps_b = [graph additionWithPrimaryTensor:mps_b secondaryTensor:mps_bias name:nil];
+						[inputTensors addObject:mps_input_bias];
+						[inputShapedTypes addObject:mps_bias_shape];
+					}
+					[resultTensors addObject:mps_b];
+				});
+				MPSGraphTensorData* data_a = ccv_nnc_mps_graph_tensor_data_with_buffer(a, adim, astride, a_data, a_dataof);
+				MPSGraphTensorData* data_w = ccv_nnc_mps_graph_tensor_data_with_buffer(w, w->info.dim, w->stride, w_data, w_dataof);
+				if (bias)
+				{
+					MPSGraphTensorData* data_bias = ccv_nnc_mps_graph_tensor_data(bias, biasdim, biasstride);
+					MPSGraphTensorData* data[] = {data_a, data_w, data_bias};
+					ccv_nnc_mps_graph_executable_result(executable, command_buffer, @[data[indices[0]], data[indices[1]], data[indices[2]]], &b, (int*[]){ b->info.dim }, (int*[]){ b->stride }, 1, 0);
+				} else {
+					MPSGraphTensorData* data[] = {data_a, data_w};
+					ccv_nnc_mps_graph_executable_result(executable, command_buffer, @[data[indices[0]], data[indices[1]]], &b, (int*[]){ b->info.dim }, (int*[]){ b->stride }, 1, 0);
+				}
+			}
+			ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+		}
+	}
+	return CCV_NNC_EXEC_SUCCESS;
+}
+
+static int _ccv_nnc_gemm_back(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint, const int flags, ccv_nnc_tensor_t* const* const inputs, const int input_size, ccv_nnc_tensor_t* const* const outputs, const int output_size, ccv_nnc_stream_context_t* const stream_context)
+{
+	// inputs: gradient g, forw prop input a, [w]
+	// outputs: output gradient h, weight updates dw, bias updates bias
+	assert(input_size >= 2 && output_size >= 1);
+	const ccv_nnc_tensor_view_t* g = (const ccv_nnc_tensor_view_t*)inputs[0];
+	ccv_nnc_tensor_view_t* dw = output_size > 1 ? (ccv_nnc_tensor_view_t*)outputs[1] : 0;
+	ccv_nnc_tensor_view_t* bias = output_size > 2 ? (ccv_nnc_tensor_view_t*)outputs[2] : 0;
+
+	const ccv_nnc_tensor_view_t* a = input_size > 1 ? (const ccv_nnc_tensor_view_t*)inputs[1] : 0;
+	ccv_nnc_tensor_view_t* h = (ccv_nnc_tensor_view_t*)outputs[0];
+	const ccv_nnc_tensor_view_t* w = input_size > 2 ? (const ccv_nnc_tensor_view_t*)inputs[2] : 0;
+
+	assert(!bias || (bias->info.dim[1] == 0 || bias->info.dim[2] == 0 || bias->info.dim[3] == 0)); // // It is a 2-d or 3-d array
+	const int is_transpose_a = a || h ? ccv_nnc_is_matrix_transpose(a ? a->info : h->info, cmd.info.blas.transpose_a) : 0;
+	const int is_transpose_w = w || dw ? ccv_nnc_is_matrix_transpose(w ? w->info : dw->info, cmd.info.blas.transpose_b) : 0;
+	const int a_datatype = a ? (CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX ? ((a->info.datatype & 0xff) << 12) : a->info.datatype) : 0;
+	const int w_datatype = w ? (CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX ? ((w->info.datatype & 0xff) << 12) : w->info.datatype) : 0;
+
+	@autoreleasepool {
+		const int is_contiguous =
+			(!CCV_IS_TENSOR_VIEW(g) || ccv_nnc_tensor_view_is_contiguous(g->info.dim, g->stride)) &&
+			(w ? (!CCV_IS_TENSOR_VIEW(w) || ccv_nnc_tensor_view_is_contiguous(w->info.dim, w->stride)) : 1) &&
+			(dw ? (!CCV_IS_TENSOR_VIEW(dw) || ccv_nnc_tensor_view_is_contiguous(dw->info.dim, dw->stride)) : 1) &&
+			(a ? (!CCV_IS_TENSOR_VIEW(a) || ccv_nnc_tensor_view_is_contiguous(a->info.dim, a->stride)) : 1) &&
+			(h ? (!CCV_IS_TENSOR_VIEW(h) || ccv_nnc_tensor_view_is_contiguous(h->info.dim, h->stride)) : 1);
+
+		const int is_same_dtype =
+			(w ? (g->info.datatype == w_datatype) : 1) &&
+			(dw ? (g->info.datatype == dw->info.datatype) : 1) &&
+			(a ? (g->info.datatype == a_datatype) : 1) &&
+			(h ? (g->info.datatype == h->info.datatype) : 1);
+
+		int is_supported_dtype = 0;
+		uint32_t mtl_data_type = UINT32_MAX;
+		switch (g->info.datatype) {
+			case CCV_16F: {
+				is_supported_dtype = 1;
+				mtl_data_type = 16;
+				break;
+			}
+			case CCV_16BF: {
+				is_supported_dtype = 1;
+				mtl_data_type = 121;
+				break;
+			}
+			case CCV_32F: {
+				is_supported_dtype = 1;
+				mtl_data_type = 3;
+				break;
+			}
+			default: {
+				break;
+			}
+		}
+		int i;
+		int w_batch_size, w_rows, w_cols, w_batch_inc, w_rows_inc, w_cols_inc;
+		int dw_batch_size, dw_rows, dw_cols, dw_batch_inc, dw_rows_inc, dw_cols_inc;
+		int g_batch_size, g_rows, g_cols, g_batch_inc, g_rows_inc, g_cols_inc;
+		const static int no_transpose[2] = {};
+		if (w)
+			ccv_nnc_tensor_get_matrix_params(w->info, CCV_IS_TENSOR_VIEW(w) ? w->stride : 0, w->info.dim, cmd.info.blas.transpose_b, &w_batch_size, &w_rows, &w_cols, &w_batch_inc, &w_rows_inc, &w_cols_inc);
+		if (dw)
+			ccv_nnc_tensor_get_matrix_params(dw->info, CCV_IS_TENSOR_VIEW(dw) ? dw->stride : 0, dw->info.dim, cmd.info.blas.transpose_b, &dw_batch_size, &dw_rows, &dw_cols, &dw_batch_inc, &dw_rows_inc, &dw_cols_inc);
+		ccv_nnc_tensor_get_matrix_params(g->info, CCV_IS_TENSOR_VIEW(g) ? g->stride : 0, g->info.dim, no_transpose, &g_batch_size, &g_rows, &g_cols, &g_batch_inc, &g_rows_inc, &g_cols_inc);
+		const int g_nd = ccv_nnc_tensor_nd(g->info.dim);
+		g_batch_size = g_nd < 3 ? 1 : g->info.dim[g_nd - 3];
+		for (i = 0; i < g_nd - 3; i++)
+			g_batch_size *= g->info.dim[i];
+		const int w_nd = w ? ccv_nnc_tensor_nd(w->info.dim) : 1;
+		w_batch_size = w_nd < 3 ? 1 : w->info.dim[w_nd - 3];
+		for (i = 0; i < w_nd - 3; i++)
+			w_batch_size *= w->info.dim[i];
+		const int dw_nd = dw ? ccv_nnc_tensor_nd(dw->info.dim) : 1;
+		dw_batch_size = dw_nd < 3 ? 1 : dw->info.dim[dw_nd - 3];
+		for (i = 0; i < dw_nd - 3; i++)
+			dw_batch_size *= dw->info.dim[i];
+		const int a_nd = a ? ccv_nnc_tensor_nd(a->info.dim) : 1;
+		int a_batch_size = a_nd < 3 ? 1 : a->info.dim[a_nd - 3];
+		for (i = 0; i < a_nd - 3; i++)
+			a_batch_size *= a->info.dim[i];
+		const int h_nd = h ? ccv_nnc_tensor_nd(h->info.dim) : 1;
+		int h_batch_size = h_nd < 3 ? 1 : h->info.dim[h_nd - 3];
+		for (i = 0; i < h_nd - 3; i++)
+			h_batch_size *= h->info.dim[i];
+
+		const int is_same_batch =
+			(w ? g_batch_size == w_batch_size : 1) &&
+			(a ? g_batch_size == a_batch_size : 1) &&
+			(dw ? g_batch_size == dw_batch_size : 1) &&
+			(h ? g_batch_size == h_batch_size : 1);
+
+		// NNC uses the convention B = A * W.
+		// MFA uses the convention C = A * B.
+
+		ccv_nnc_mfa_context_t* context = ccv_nnc_default_mfa_context();
+		const int load_m = !!(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_GEMM_SPECIALIZING_M);
+		const int is_mfa_supported =
+			ccv_nnc_mfa_context_supported(context) && is_contiguous && is_same_dtype && is_supported_dtype && is_same_batch && !bias && !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA) && !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_GEMM);
+
+		size_t a_data_size = 0;
+		if (a && dw && CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX)
+			a_data_size = _ccv_nnc_qx_fp_data_size(a->info);
+		size_t w_data_size = 0;
+		if (w && h && CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX)
+			w_data_size = _ccv_nnc_qx_fp_data_size(w->info);
+		if (is_mfa_supported)
+		{
+			mtl_buffer_t* scratch = 0;
+			size_t scratch_offset = 0;
+			ccv_nnc_mfa_gemm_params_t h_params;
+			// On supported devices, use Metal directly.
+			if (h)
+			{
+				if (is_transpose_a)
+				{
+					ccv_nnc_mfa_gemm_params_t params = {
+						.data_type = mtl_data_type,
+						.M = (uint32_t)w_rows, // C_rows
+						.N = (uint32_t)g_rows, // C_cols
+						.K = (uint32_t)w_cols, // B_rows
+						.A_trans = 1,
+						.B_trans = (is_transpose_w ? 1 : 0),
+						.D_trans = 0,
+						.fused_bias = 0,
+						.register_float = 1,
+						.use_neural_accelerators = !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_NEURAL_ACCELERATORS) && ccv_nnc_mfa_has_neural_accelerators(context) && (mtl_data_type != 121 || ccv_nnc_mfa_neural_accelerators_support_bfloat(context)),
+
+						.batch_dimension = g_batch_size,
+						.batch_stride_a = w_batch_size > 1 ? w_rows * w_cols : 0,
+						.batch_stride_b = g_batch_size > 1 ? g_rows * w_cols : 0,
+						.batch_stride_c = h_batch_size > 1 ? w_rows * g_rows : 0,
+						.batch_stride_d = 0,
+						.loadM = 0,
+					};
+					ccv_nnc_mfa_prepare_gemm(context, params);
+					h_params = params;
+					scratch_offset = ccv_max(scratch_offset, ccv_nnc_mfa_gemm_reserved_scratch_size(params));
+				} else {
+					ccv_nnc_mfa_gemm_params_t params = {
+						.data_type = mtl_data_type,
+						.M = (uint32_t)g_rows, // C_rows
+						.N = (uint32_t)w_rows, // C_cols
+						.K = (uint32_t)w_cols, // B_rows
+						.A_trans = 0,
+						.B_trans = (is_transpose_w ? 0 : 1),
+						.D_trans = 0,
+						.fused_bias = 0,
+						.register_float = 1,
+						.use_neural_accelerators = !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_NEURAL_ACCELERATORS) && ccv_nnc_mfa_has_neural_accelerators(context) && (mtl_data_type != 121 || ccv_nnc_mfa_neural_accelerators_support_bfloat(context)),
+
+						.batch_dimension = g_batch_size,
+						.batch_stride_a = g_batch_size > 1 ? g_rows * w_cols : 0,
+						.batch_stride_b = w_batch_size > 1 ? w_rows * w_cols : 0,
+						.batch_stride_c = h_batch_size > 1 ? g_rows * w_rows : 0,
+						.batch_stride_d = 0,
+						.loadM = load_m,
+					};
+					ccv_nnc_mfa_prepare_gemm(context, params);
+					h_params = params;
+					scratch_offset = ccv_max(scratch_offset, ccv_nnc_mfa_gemm_reserved_scratch_size(params));
+				}
+			}
+
+			ccv_nnc_mfa_gemm_params_t dw_params;
+			// On supported devices, use Metal directly.
+			if (dw)
+			{
+				if (is_transpose_w)
+				{
+					ccv_nnc_mfa_gemm_params_t params = {
+						.data_type = mtl_data_type,
+						.M = (uint32_t)dw_cols, // C_rows
+						.N = (uint32_t)dw_rows, // C_cols
+						.K = (uint32_t)g_rows, // B_rows
+						.A_trans = 1,
+						.B_trans = (is_transpose_a ? 1 : 0),
+						.D_trans = 0,
+						.fused_bias = 0,
+						.register_float = 1,
+						.use_neural_accelerators = !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_NEURAL_ACCELERATORS) && ccv_nnc_mfa_has_neural_accelerators(context) && (mtl_data_type != 121 || ccv_nnc_mfa_neural_accelerators_support_bfloat(context)),
+
+						.batch_dimension = g_batch_size,
+						.batch_stride_a = g_batch_size > 1 ? dw_cols * g_rows : 0,
+						.batch_stride_b = a_batch_size > 1 ? dw_rows * g_rows : 0,
+						.batch_stride_c = dw_batch_size > 1 ? dw_cols * dw_rows : 0,
+						.batch_stride_d = 0,
+						.loadM = 0,
+					};
+					ccv_nnc_mfa_prepare_gemm(context, params);
+					dw_params = params;
+					scratch_offset = ccv_max(scratch_offset, ccv_nnc_mfa_gemm_reserved_scratch_size(params));
+				} else {
+					ccv_nnc_mfa_gemm_params_t params = {
+						.data_type = mtl_data_type,
+						.M = (uint32_t)dw_rows, // C_rows
+						.N = (uint32_t)dw_cols, // C_cols
+						.K = (uint32_t)g_rows, // B_rows
+						.A_trans = (is_transpose_a ? 0 : 1),
+						.B_trans = 0,
+						.D_trans = 0,
+						.fused_bias = 0,
+						.register_float = 1,
+						.use_neural_accelerators = !(ccv_nnc_flags() & CCV_NNC_DISABLE_MFA_NEURAL_ACCELERATORS) && ccv_nnc_mfa_has_neural_accelerators(context) && (mtl_data_type != 121 || ccv_nnc_mfa_neural_accelerators_support_bfloat(context)),
+
+						.batch_dimension = g_batch_size,
+						.batch_stride_a = a_batch_size > 1 ? dw_rows * g_rows : 0,
+						.batch_stride_b = g_batch_size > 1 ? dw_cols * g_rows : 0,
+						.batch_stride_c = dw_batch_size > 1 ? dw_rows * dw_cols : 0,
+						.batch_stride_d = 0,
+						.loadM = load_m && is_transpose_a,
+					};
+					ccv_nnc_mfa_prepare_gemm(context, params);
+					dw_params = params;
+					scratch_offset = ccv_max(scratch_offset, ccv_nnc_mfa_gemm_reserved_scratch_size(params));
+				}
+			}
+			if (a_data_size + w_data_size > 0)
+				scratch = ccv_nnc_mfa_request_scratch(context, scratch_offset + a_data_size + w_data_size);
+			mtl_buffer_t* a_data = 0;
+			size_t a_dataof = 0;
+			ccv_nnc_mfa_qx_decode_params_t a_decode_params;
+			if (a && dw)
+			{
+				a_data = mpgetbuffer((ccv_nnc_tensor_t*)a);
+				a_dataof = (size_t)mpgetoffset((ccv_nnc_tensor_t*)a);
+				if (CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX)
+				{
+					a_decode_params = _ccv_nnc_mfa_qx_decode_params(a->info, mtl_data_type);
+					_ccv_nnc_mfa_prepare_qx_decode(context, a_decode_params);
+					a_data = scratch;
+					a_dataof = scratch_offset;
+				}
+			}
+			mtl_buffer_t* w_data = 0;
+			size_t w_dataof = 0;
+			ccv_nnc_mfa_qx_decode_params_t w_decode_params;
+			if (w && h)
+			{
+				w_data = mpgetbuffer((ccv_nnc_tensor_t*)w);
+				w_dataof = (size_t)mpgetoffset((ccv_nnc_tensor_t*)w);
+				if (CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX)
+				{
+					w_decode_params = _ccv_nnc_mfa_qx_decode_params(w->info, mtl_data_type);
+					_ccv_nnc_mfa_prepare_qx_decode(context, w_decode_params);
+					w_data = scratch;
+					w_dataof = scratch_offset + a_data_size;
+				}
+			}
+
+			// Creating a new command buffer has a >10 µs penalty CPU-side. Still
+			// faster the >50 µs penalty for MPSGraph (probably why
+			// MPSMatrixMultiplication is faster for GEMM).
+			mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+
+			if (h)
+			{
+				if (CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX)
+				{
+					_ccv_nnc_mfa_encode_qx_decode(context, w_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)w), w->dataof, (mtl_buffer_t*)scratch, scratch_offset + a_data_size);
+				}
+				if (is_transpose_a)
+				{
+					mtl_buffer_t* tensors[4] = {
+						w_data, // A
+						mpgetbuffer((ccv_nnc_tensor_t*)g), // B
+						mpgetbuffer((ccv_nnc_tensor_t*)h), // C
+						NULL,
+					};
+					size_t tensor_offsets[4] = {
+						w_dataof, // A offset
+						g->dataof, // B offset
+						h->dataof, // C offset
+						0, // D offset
+					};
+					ccv_nnc_mfa_encode_gemm(context, h_params, command_batch, tensors, tensor_offsets);
+				} else {
+					mtl_buffer_t* tensors[4] = {
+						mpgetbuffer((ccv_nnc_tensor_t*)g), // A
+						w_data, // B
+						mpgetbuffer((ccv_nnc_tensor_t*)h), // C
+						NULL,
+					};
+					size_t tensor_offsets[4] = {
+						g->dataof, // A offset
+						w_dataof, // B offset
+						h->dataof, // C offset
+						0, // D offset
+					};
+					ccv_nnc_mfa_encode_gemm(context, h_params, command_batch, tensors, tensor_offsets);
+				}
+			}
+			if (dw)
+			{
+				if (CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX)
+				{
+					_ccv_nnc_mfa_encode_qx_decode(context, a_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)a), a->dataof, (mtl_buffer_t*)scratch, scratch_offset);
+				}
+				if (is_transpose_w)
+				{
+					mtl_buffer_t* tensors[4] = {
+						mpgetbuffer((ccv_nnc_tensor_t*)g), // A
+						a_data, // B
+						mpgetbuffer((ccv_nnc_tensor_t*)dw), // C
+						NULL,
+					};
+					size_t tensor_offsets[4] = {
+						g->dataof, // A offset
+						a_dataof, // B offset
+						dw->dataof, // C offset
+						0, // D offset
+					};
+					ccv_nnc_mfa_encode_gemm(context, dw_params, command_batch, tensors, tensor_offsets);
+				} else {
+					mtl_buffer_t* tensors[4] = {
+						a_data, // A
+						mpgetbuffer((ccv_nnc_tensor_t*)g), // B
+						mpgetbuffer((ccv_nnc_tensor_t*)dw), // C
+						NULL,
+					};
+					size_t tensor_offsets[4] = {
+						a_dataof, // A offset
+						g->dataof, // B offset
+						dw->dataof, // C offset
+						0, // D offset
+					};
+					ccv_nnc_mfa_encode_gemm(context, dw_params, command_batch, tensors, tensor_offsets);
+				}
+			}
+			ccv_nnc_stream_context_finish_command_batch(stream_context, command_batch);
+		} else {
+			mtl_buffer_t* a_data = 0;
+			size_t a_dataof = 0;
+			if (a && dw)
+			{
+				a_data = mpgetbuffer((ccv_nnc_tensor_t*)a);
+				a_dataof = (size_t)mpgetoffset((ccv_nnc_tensor_t*)a);
+			}
+			mtl_buffer_t* w_data = 0;
+			size_t w_dataof = 0;
+			if (w && h)
+			{
+				w_data = mpgetbuffer((ccv_nnc_tensor_t*)w);
+				w_dataof = (size_t)mpgetoffset((ccv_nnc_tensor_t*)w);
+			}
+			MPSCommandBuffer* command_buffer;
+			if ((a && dw && CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX) || (w && h && CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX))
+			{
+				mtl_buffer_t* scratch = 0;
+				if (a_data_size + w_data_size > 0)
+					scratch = ccv_nnc_mfa_request_scratch(context, a_data_size + w_data_size);
+				ccv_nnc_mfa_qx_decode_params_t a_decode_params;
+				if (a && dw && CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX)
+				{
+					a_decode_params = _ccv_nnc_mfa_qx_decode_params(a->info, mtl_data_type);
+					_ccv_nnc_mfa_prepare_qx_decode(context, a_decode_params);
+					a_data = scratch;
+					a_dataof = 0;
+				}
+				ccv_nnc_mfa_qx_decode_params_t w_decode_params;
+				if (w && h && CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX)
+				{
+					w_decode_params = _ccv_nnc_mfa_qx_decode_params(w->info, mtl_data_type);
+					_ccv_nnc_mfa_prepare_qx_decode(context, w_decode_params);
+					w_data = scratch;
+					w_dataof = a_data_size;
+				}
+				mtl_command_batch_t* command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
+				if (a && dw && CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX)
+				{
+					_ccv_nnc_mfa_encode_qx_decode(context, a_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)a), a->dataof, (mtl_buffer_t*)scratch, 0);
+				}
+				if (w && h && CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX)
+				{
+					_ccv_nnc_mfa_encode_qx_decode(context, w_decode_params, command_batch, mpgetbuffer((ccv_nnc_tensor_t*)w), w->dataof, (mtl_buffer_t*)scratch, a_data_size);
+				}
+				command_buffer = ccv_nnc_stream_context_finish_command_batch_encoding_and_return_mps_command_buffer(stream_context, command_batch);
+			} else // Otherwise, incur the ~10-50 microsecond latency of MPS.
+				command_buffer = ccv_nnc_stream_context_start_mps_command_buffer(stream_context);
+
+			if (h) {
+				assert(w); // when calculate h, w must exist
+				// [output gradient]
+				ccv_nnc_mps_graph_key_t key = ccv_nnc_mps_graph_key_new(cmd, 0, hint, flags, inputs, input_size, outputs, output_size);
+				int indices[2];
+
+				MPSGraphExecutable* executable = ccv_nnc_mps_graph_executable_cache(key, indices, ^void (MPSGraph* graph, NSMutableArray<MPSGraphTensor*>* inputTensors, NSMutableArray<MPSGraphShapedType*>* inputShapedTypes, NSMutableArray<MPSGraphTensor*>* resultTensors) {
+					MPSGraphTensor* mps_input_g;
+					MPSGraphTensor* mps_g = ccv_nnc_mps_graph_tensor_input(graph, g, g->info.dim, g->stride, &mps_input_g);
+					[inputTensors addObject:mps_input_g];
+					MPSGraphShapedType* mps_g_shape = ccv_nnc_mps_graph_tensor_input_shape(g, g->info.dim, g->stride);
+					[inputShapedTypes addObject:mps_g_shape];
+
+					MPSGraphTensor* mps_input_w;
+					MPSGraphTensor* mps_w = ccv_nnc_mps_graph_tensor_input(graph, w, w->info.dim, w->stride, &mps_input_w);
+					[inputTensors addObject:mps_input_w];
+					MPSGraphShapedType* mps_w_shape = ccv_nnc_mps_graph_tensor_input_shape(w, w->info.dim, w->stride);
+					[inputShapedTypes addObject:mps_w_shape];
+
+					if (!is_transpose_w)
+						mps_w = [graph transposeTensor:mps_w dimension:-2 withDimension:-1 name:nil];
+
+					MPSGraphTensor* mps_h = [graph matrixMultiplicationWithPrimaryTensor:mps_g secondaryTensor:mps_w name:nil];
+					if (is_transpose_a)
+						mps_h = [graph transposeTensor:mps_h dimension:-2 withDimension:-1 name:nil];
+
+					const NSUInteger mps_h_nd = mps_h.shape.count;
+					int flag = (h_nd < mps_h_nd);
+					int i;
+					for (i = 0; !flag && i < mps_h_nd; i++)
+						if (mps_h.shape[i].integerValue != h->info.dim[i])
+							flag = 1;
+
+					// if target h nd smaller than current mps_h_nd (for example, doing batch), mps_h needs to be reduced
+					if (flag) {
+						NSMutableArray<NSNumber*>* axes = [NSMutableArray new];
+						for (i = 0; i < mps_h_nd - h_nd; i++)
+							if (mps_h.shape[i].integerValue != 1)
+								[axes addObject:@(i)];
+						const int h_start = mps_h_nd - h_nd;
+						assert(h_start >= 0);
+						for (i = h_start; i < mps_h_nd; i++)
+							if (mps_h.shape[i].integerValue != h->info.dim[i - h_start])
+								[axes addObject:@(i)];
+						if (axes.count > 0)
+							mps_h = [graph reductionSumWithTensor:mps_h axes:axes name:nil];
+						[axes release];
+					}
+					[resultTensors addObject:mps_h];
+				});
+				MPSGraphTensorData* data_g = ccv_nnc_mps_graph_tensor_data(g, g->info.dim, g->stride);
+				MPSGraphTensorData* data_w = ccv_nnc_mps_graph_tensor_data_with_buffer(w, w->info.dim, w->stride, w_data, w_dataof);
+				MPSGraphTensorData* data[] = {data_g, data_w};
+				ccv_nnc_mps_graph_executable_result(executable, command_buffer, @[data[indices[0]], data[indices[1]]], &h, (int*[]){ h->info.dim }, (int*[]){ h->stride }, 1, 0);
+			}
+
+			if (dw) {
+				assert(a); // when calculate dw, a must exist
+
+				// [weight updates]
+				ccv_nnc_mps_graph_key_t dw_key = ccv_nnc_mps_graph_key_new(cmd, 1, hint, flags, inputs, input_size, outputs, output_size);
+				int dw_indices[2];
+
+				MPSGraphExecutable* executable_dw = ccv_nnc_mps_graph_executable_cache(dw_key, dw_indices, ^void (MPSGraph* graph, NSMutableArray<MPSGraphTensor*>* inputTensors, NSMutableArray<MPSGraphShapedType*>* inputShapedTypes, NSMutableArray<MPSGraphTensor*>* resultTensors) {
+					MPSGraphTensor* mps_input_g;
+					MPSGraphTensor* mps_g = ccv_nnc_mps_graph_tensor_input(graph, g, g->info.dim, g->stride, &mps_input_g);
+					[inputTensors addObject:mps_input_g];
+					MPSGraphShapedType* mps_g_shape = ccv_nnc_mps_graph_tensor_input_shape(g, g->info.dim, g->stride);
+					[inputShapedTypes addObject:mps_g_shape];
+
+					MPSGraphTensor* mps_input_a;
+					MPSGraphTensor* mps_a = ccv_nnc_mps_graph_tensor_input(graph, a, a->info.dim, a->stride, &mps_input_a);
+					[inputTensors addObject:mps_input_a];
+					MPSGraphShapedType* mps_a_shape = ccv_nnc_mps_graph_tensor_input_shape(a, a->info.dim, a->stride);
+					[inputShapedTypes addObject:mps_a_shape];
+					if (!is_transpose_a)
+						mps_a = [graph transposeTensor:mps_a dimension:-2 withDimension:-1 name:nil];
+
+					MPSGraphTensor* mps_dw = [graph matrixMultiplicationWithPrimaryTensor:mps_a secondaryTensor:mps_g name:nil];
+					if (is_transpose_w)
+						mps_dw = [graph transposeTensor:mps_dw dimension:-2 withDimension:-1 name:nil];
+
+					const NSUInteger mps_dw_nd = mps_dw.shape.count;
+					int flag = (dw_nd < mps_dw_nd);
+					int i;
+					for (i = 0; !flag && i < mps_dw_nd; i++)
+						if (mps_dw.shape[i].integerValue != dw->info.dim[i])
+							flag = 1;
+
+					// if target dw nd smaller than current mupltiplication nd (like we are doing batch), mps_dw needs to be reduced
+					if (flag) {
+						NSMutableArray<NSNumber*>* axes = [NSMutableArray new];
+						for (i = 0; i < mps_dw_nd - dw_nd; i++)
+							if (mps_dw.shape[i].integerValue != 1)
+								[axes addObject:@(i)];
+						const int dw_start = mps_dw_nd - dw_nd;
+						assert(dw_start >= 0);
+						for (i = dw_start; i < mps_dw_nd; i++)
+							if (mps_dw.shape[i].integerValue != dw->info.dim[i - dw_start])
+								[axes addObject:@(i)];
+						if (axes.count > 0)
+							mps_dw = [graph reductionSumWithTensor:mps_dw axes:axes name:nil];
+						[axes release];
+					}
+
+					[resultTensors addObject:mps_dw];
+
+				});
+				MPSGraphTensorData* data_g = ccv_nnc_mps_graph_tensor_data(g, g->info.dim, g->stride);
+				MPSGraphTensorData* data_a = ccv_nnc_mps_graph_tensor_data_with_buffer(a, a->info.dim, a->stride, a_data, a_dataof);
+				MPSGraphTensorData* data[] = {data_g, data_a};
+				ccv_nnc_mps_graph_executable_result(executable_dw, command_buffer, @[data[dw_indices[0]], data[dw_indices[1]]], &dw , (int*[]){ dw->info.dim }, (int*[]){ dw->stride }, 1, 0);
+			}
+
+			if (bias) {
+				// [bias updates]
+				ccv_nnc_mps_graph_key_t db_key = ccv_nnc_mps_graph_key_new(cmd, 2, hint, flags, inputs, input_size, outputs, output_size);
+				int db_indices[1];
+
+				MPSGraphExecutable* executable_db = ccv_nnc_mps_graph_executable_cache(db_key, db_indices, ^void (MPSGraph* graph, NSMutableArray<MPSGraphTensor*>* inputTensors, NSMutableArray<MPSGraphShapedType*>* inputShapedTypes, NSMutableArray<MPSGraphTensor*>* resultTensors) {
+					MPSGraphTensor* mps_input_g;
+					MPSGraphTensor* mps_g = ccv_nnc_mps_graph_tensor_input(graph, g, g->info.dim, g->stride, &mps_input_g);
+					[inputTensors addObject:mps_input_g];
+					MPSGraphShapedType* mps_g_shape = ccv_nnc_mps_graph_tensor_input_shape(g, g->info.dim, g->stride);
+					[inputShapedTypes addObject:mps_g_shape];
+
+					MPSGraphShapedType* mps_bias_shape = ccv_nnc_mps_graph_tensor_input_shape(bias, bias->info.dim, bias->stride);
+
+					NSMutableArray<NSNumber*>* bias_target_shape = mps_bias_shape.shape.mutableCopy;
+					NSMutableArray<NSNumber*>* axes = [NSMutableArray new];
+					const int g_nd = ccv_nnc_tensor_nd(g->info.dim);
+					const int bias_nd = ccv_nnc_tensor_nd(bias->info.dim);
+					int i;
+
+					// make bias_target_shape has same dim as g before finding reduce axis
+					for (i = 0; i < g_nd - bias_nd; i++)
+						[bias_target_shape insertObject:@(1) atIndex:0]; // [1,..,1,N]
+
+					for (i = 0; i < g_nd; i++)
+						if (g->info.dim[i] != bias_target_shape[i].integerValue)
+							[axes addObject:@(i)];
+					MPSGraphTensor* mps_db = [graph reductionSumWithTensor:mps_g axes:axes name:nil];
+					[bias_target_shape release];
+					[axes release];
+					[resultTensors addObject:mps_db];
+				});
+				MPSGraphTensorData* data_g = ccv_nnc_mps_graph_tensor_data(g, g->info.dim, g->stride);
+				ccv_nnc_mps_graph_executable_result(executable_db, command_buffer, @[data_g], &bias , (int*[]){ bias->info.dim  }, (int*[]){ bias->info.dim }, 1, 0);
+			}
+			ccv_nnc_stream_context_finish_mps_command_buffer(stream_context, command_buffer);
+		}
+	}
+
+	return CCV_NNC_EXEC_SUCCESS;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_NCHW;
+	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_QX | CCV_16BF;
+	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_gemm_forw;
+}
+
+REGISTER_COMMAND_BACKEND(CCV_NNC_GEMM_BACKWARD, CCV_NNC_BACKEND_MPS)(ccv_nnc_cmd_backend_registry_t* const registry)
+{
+	registry->tensor_formats = CCV_TENSOR_FORMAT_NHWC | CCV_TENSOR_FORMAT_NCHW;
+	registry->tensor_datatypes = CCV_32F | CCV_16F | CCV_QX | CCV_16BF;
+	registry->tensor_memory = CCV_TENSOR_GPU_MEMORY;
+	registry->algorithms = 1;
+	registry->exec = _ccv_nnc_gemm_back;
+}

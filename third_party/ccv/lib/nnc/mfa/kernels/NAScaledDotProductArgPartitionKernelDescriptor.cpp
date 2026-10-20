@@ -1,0 +1,26 @@
+#include "NAScaledDotProductArgPartitionKernelDescriptor.hpp"
+#include "../ccv_nnc_mfa_hash.hpp"
+
+bool NAScaledDotProductArgPartitionKernelDescriptor::operator==(const NAScaledDotProductArgPartitionKernelDescriptor& rhs) const {
+  return
+  memoryPrecision == rhs.memoryPrecision &&
+  kth == rhs.kth &&
+  scoreMode == rhs.scoreMode &&
+  scoreBlockM == rhs.scoreBlockM &&
+  scoreBlockN == rhs.scoreBlockN &&
+  scoreSIMDGroups == rhs.scoreSIMDGroups &&
+  loadM == rhs.loadM &&
+  loadC == rhs.loadC &&
+  isCausal == rhs.isCausal;
+}
+
+std::size_t std::hash<NAScaledDotProductArgPartitionKernelDescriptor>::operator()(const NAScaledDotProductArgPartitionKernelDescriptor& hash) const noexcept {
+  using namespace ccv::nnc::mfa::hash;
+  std::size_t seed = 0;
+  seed = combine_32(seed, hash.scoreMode);
+  seed = combine_32(seed, hash.loadM ? 1 : 0);
+  seed = combine_64(seed, pack_64(simd::uint2 { (unsigned int)hash.memoryPrecision.value, hash.kth }));
+  seed = combine_32(seed, pack_32(simd::ushort2 { hash.scoreBlockM, hash.scoreBlockN }));
+  seed = combine_32(seed, pack_32(simd::ushort2 { hash.scoreSIMDGroups, (unsigned short)((hash.loadC ? 1 : 0) | (hash.isCausal ? 2 : 0)) }));
+  return seed;
+}

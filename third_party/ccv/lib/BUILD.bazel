@@ -1,0 +1,623 @@
+load("@local_config_cuda//cuda:build_defs.bzl", "cuda_library")
+load("@local_config_ccv//config:build_defs.bzl", "ccv_default_copts")
+
+cc_library(
+	name = "sqlite3_hdrs",
+	hdrs = [
+		"3rdparty/sqlite3/sqlite3.h"
+	],
+)
+
+
+cc_library(
+	name = "dSFMT",
+	srcs = [
+		"3rdparty/dsfmt/dSFMT.c"
+	],
+	hdrs = [
+		"3rdparty/dsfmt/dSFMT-common.h",
+		"3rdparty/dsfmt/dSFMT.h",
+		"3rdparty/dsfmt/dSFMT-params.h",
+		"3rdparty/dsfmt/dSFMT-params19937.h"
+	],
+	copts = ccv_default_copts()
+)
+
+cc_library(
+	name = "kissfft",
+	srcs = glob(["3rdparty/kissfft/*.c"]),
+	hdrs = glob(["3rdparty/kissfft/*.h"]),
+	copts = ccv_default_copts()
+)
+
+cc_library(
+	name = "metal_cpp_hdrs",
+	srcs = [
+		"nnc/mfa/3rdparty/metal-cpp/Dispatch.cpp",
+	],
+	hdrs = [
+		"nnc/mfa/3rdparty/metal-cpp/Dispatch.hpp",
+		"nnc/mfa/3rdparty/metal-cpp/Metal.hpp",
+	],
+)
+
+cc_library(
+	name = "siphash",
+	srcs = [
+		"3rdparty/siphash/siphash24.c"
+	],
+	hdrs = [
+		"3rdparty/siphash/siphash24.h"
+	],
+	copts = ccv_default_copts()
+)
+
+cc_library(
+	name = "SFMT_hdrs",
+	hdrs = [
+		"3rdparty/sfmt/SFMT.h",
+		"3rdparty/sfmt/SFMT-common.h",
+		"3rdparty/sfmt/SFMT-params.h",
+		"3rdparty/sfmt/SFMT-params19937.h"
+	],
+)
+
+cc_library(
+	name = "SFMT",
+	srcs = [
+		"3rdparty/sfmt/SFMT.c"
+	],
+	hdrs = [
+		"3rdparty/sfmt/SFMT.h",
+		"3rdparty/sfmt/SFMT-common.h",
+		"3rdparty/sfmt/SFMT-params.h",
+		"3rdparty/sfmt/SFMT-params19937.h"
+	],
+	visibility = ["//visibility:public"],
+	copts = ccv_default_copts(),
+	tags = ["swift_module=C_sfmt"],
+)
+
+cc_library(
+	name = "khash",
+	srcs = [],
+	hdrs = [
+		"3rdparty/khash/khash.h",
+	]
+)
+
+cc_library(
+	name = "jemalloc",
+	srcs = [],
+	hdrs = [
+		"3rdparty/jemalloc/rb.h",
+	]
+)
+
+cc_library(
+	name = "ccv_headers",
+	srcs = [],
+	hdrs = [
+		"ccv.h",
+		"ccv_internal.h",
+		"nnc/ccv_nnc_tfb.h",
+	],
+	includes = [
+		"."
+	],
+	deps = [
+		"@local_config_ccv//config:config"
+	]
+)
+
+cc_library(
+	name = "ccv_cache",
+	srcs = [
+		"ccv_cache.c"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":siphash",
+		":ccv_headers"
+	]
+)
+
+cc_library(
+	name = "ccv_memory",
+	srcs = [
+		"ccv_memory.c"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":ccv_cache",
+		":ccv_headers"
+	]
+)
+
+cc_library(
+	name = "ccv_algebra",
+	srcs = [
+		"ccv_algebra.c"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":ccv_memory",
+		":ccv_headers"
+	]
+)
+
+cc_library(
+	name = "ccv_util",
+	srcs = [
+		"ccv_util.c"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":ccv_memory",
+		":ccv_headers"
+	]
+)
+
+cc_library(
+	name = "ccv_output",
+	srcs = [
+		"ccv_output.c"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":ccv_headers"
+	]
+)
+
+cc_library(
+	name = "ccv_io",
+	srcs = [
+		"ccv_io.c",
+		"io/_ccv_io_binary.inc",
+		"io/_ccv_io_bmp.inc",
+		"io/_ccv_io_libjpeg.inc",
+		"io/_ccv_io_libpng.inc",
+		"io/_ccv_io_raw.inc"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":ccv_memory",
+		":ccv_headers"
+	]
+)
+
+cc_library(
+	name = "ccv_image_processing",
+	srcs = [
+		"ccv_image_processing.c"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":ccv_memory",
+		":ccv_headers"
+	]
+)
+
+cc_library(
+	name = "ccv_basic",
+	srcs = [
+		"ccv_basic.c"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":ccv_memory",
+		":ccv_headers"
+	]
+)
+
+cc_library(
+	name = "ccv_resample",
+	srcs = [
+		"ccv_resample.c"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":ccv_memory",
+		":ccv_headers"
+	]
+)
+
+cc_library(
+	name = "ccv_wavelet",
+	srcs = [
+		"ccv_wavelet.c"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":ccv_memory",
+		":ccv_headers"
+	],
+)
+
+cc_library(
+	name = "ccv_numeric",
+	srcs = [
+		"ccv_numeric.c"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":ccv_memory",
+		":ccv_headers",
+		":kissfft"
+	]
+)
+
+config_setting(
+	name = "linux_build",
+	constraint_values = [
+		"@platforms//os:linux"
+	]
+)
+
+cc_library(
+	name = "ccv_cwc",
+	srcs = [
+		"cuda/cwc_convnet_ext.c"
+	],
+	hdrs = [
+		"inc/ccv_convnet_internal.h",
+		"cuda/cwc.h",
+		"cuda/cwc_ext.h",
+		"cuda/cwc_internal.h"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":ccv_headers",
+		":ccv_numeric",
+		":sqlite3_hdrs"
+	] + select({
+		":linux_build": ["@sqlite3//:SQLite3"],
+		"//conditions:default": []
+	})
+)
+
+cuda_library(
+	name = "ccv_cwc_cuda",
+	srcs = glob(["cuda/**/*.cu"]),
+	defines = [
+		"HAVE_CUDA"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":ccv_cwc",
+		"@local_config_ccv//config:cuda_deps"
+	]
+)
+
+cc_library(
+	name = "ccv",
+	srcs = [
+		"ccv_bbf.c",
+		"ccv_classic.c",
+		"ccv_convnet.c",
+		"ccv_daisy.c",
+		"ccv_dpm.c",
+		"ccv_ferns.c",
+		"ccv_icf.c",
+		"ccv_mser.c",
+		"ccv_scd.c",
+		"ccv_sift.c",
+		"ccv_sparse_coding.c",
+		"ccv_swt.c",
+		"ccv_tld.c",
+		"ccv_transform.c",
+	],
+	hdrs = [
+		"ccv.h",
+		"ccv_internal.h"
+	],
+	visibility = ["//visibility:public"],
+	copts = ccv_default_copts(),
+	tags = ["swift_module=C_ccv"],
+	deps = [
+		":sqlite3_hdrs",
+		":dSFMT",
+		":kissfft",
+		":SFMT",
+		":ccv_headers",
+		":ccv_algebra",
+		":ccv_util",
+		":ccv_output",
+		":ccv_image_processing",
+		":ccv_io",
+		":ccv_basic",
+		":ccv_resample",
+		":ccv_wavelet",
+		":ccv_numeric",
+	] + select({
+		"//config:have_cuda": [
+			":ccv_cwc_cuda"
+		],
+		"//conditions:default": [
+			":ccv_cwc"
+		]
+	}) + select({
+		":linux_build": ["@sqlite3//:SQLite3"],
+		"//conditions:default": []
+	})
+)
+
+cc_library(
+	name = "nnc_headers",
+	srcs = [
+		"nnc/co.c"
+	],
+	hdrs = [
+		"nnc/_ccv_nnc_stream.h",
+		"nnc/ccv_nnc.h",
+		"nnc/ccv_nnc_internal.h",
+		"nnc/ccv_nnc_easy.h",
+		"nnc/ccv_nnc_tfb.h",
+		"nnc/cmd/ccv_nnc_backend.h",
+		"nnc/cmd/ccv_nnc_cmd.h",
+		"nnc/cmd/ccv_nnc_cmd_easy.h",
+		"nnc/co.h",
+		"nnc/ccv_nnc_8i_rowwise_packed_grids.inc"
+	],
+	includes = [
+		"."
+	],
+	deps = [
+		":khash", # Have reference in _ccv_nnc_stream.h
+		":ccv_headers"
+	]
+)
+
+cc_library(
+	name = "cutlass_headers",
+	srcs = [],
+	hdrs = glob([
+		"nnc/gpu/3rdparty/cutlass/include/**/*.h",
+		"nnc/gpu/3rdparty/cutlass/include/**/*.hpp"
+	]),
+	includes = [
+		"nnc/gpu/3rdparty/cutlass/include"
+	],
+	deps = []
+)
+
+cuda_library(
+	name = "nnc_cuda_compat_sm80",
+	srcs = glob([
+		"nnc/gpu/3rdparty/flash_attn/**/*.cu",
+	]),
+	hdrs = glob([
+		"nnc/gpu/3rdparty/flash_attn/**/*.h",
+		"nnc/gpu/3rdparty/flash_attn/**/*.cuh",
+	]),
+	copts = ccv_default_copts() + ["-nvcc_options", "expt-relaxed-constexpr"],
+	deps = [
+		":cutlass_headers",
+		"@local_config_ccv//config:cuda_deps"
+	]
+)
+
+cuda_library(
+	name = "nnc_cuda_compat",
+	srcs = [
+		"nnc/gpu/ccv_nnc_compat.cu",
+		"nnc/gpu/ccv_nnc_palettize.cu",
+		"nnc/gpu/ccv_nnc_8i_rowwise_gemm.cu",
+	],
+	hdrs = [
+		"nnc/gpu/ccv_nnc_compat.h",
+	],
+	copts = ccv_default_copts() + ["-nvcc_options", "expt-relaxed-constexpr"],
+	deps = [
+		":cutlass_headers",
+		":nnc_headers",
+		":SFMT_hdrs",
+		"@local_config_ccv//config:cuda_deps"
+	]
+)
+
+cc_library(
+	name = "nnc_mfa_compat",
+	srcs = glob(["nnc/mfa/**/*.cpp", "nnc/mfa/**/*.inc"]),
+	hdrs = glob(["nnc/mfa/**/*.hpp"]),
+	copts = ccv_default_copts(),
+	deps = [
+		":metal_cpp_hdrs",
+		":nnc_headers"
+	]
+)
+
+config_setting(
+	name = "macos_build",
+	constraint_values = ["@platforms//os:macos"],
+	values = {"apple_platform_type": "macos"},
+)
+
+config_setting(
+	name = "catalyst_build",
+	values = {"apple_platform_type": "catalyst"},
+)
+
+objc_library(
+	name = "nnc_mps_compat",
+	non_arc_srcs = [
+		"nnc/mfa/ccv_nnc_mfa_ane_rowwise_coreml.mm",
+		"nnc/mps/ccv_nnc_mps.m",
+		"nnc/mps/ccv_nnc_palettize.m",
+	],
+	hdrs = [
+		"nnc/mps/ccv_nnc_mps.h",
+	],
+	copts = ccv_default_copts(),
+	sdk_frameworks = ["Metal", "MetalPerformanceShaders", "MetalPerformanceShadersGraph", "IOSurface", "CoreVideo", "CoreML"] + select({
+		":macos_build": ["IOKit"],
+		":catalyst_build": ["IOKit"],
+		"//conditions:default": [],
+	}),
+	deps = [
+		":nnc_mfa_compat",
+		":nnc_headers",
+		":SFMT_hdrs"
+	]
+)
+
+cuda_library(
+	name = "cmd_cuda",
+	srcs = glob(["nnc/cmd/**/*.h"]) + glob(["nnc/cmd/**/*.cu"]),
+	includes = [
+		"."
+	],
+	defines = [
+		"HAVE_CUDA"
+	] + select({
+		"//config:have_cuda_sm80": [
+			"HAVE_CUDA_SM80"
+		],
+		"//conditions:default": []
+	}),
+	copts = ccv_default_copts(),
+	deps = [
+		":nnc_headers",
+		":nnc_cuda_compat"
+	] + select({
+		"//config:have_cuda_sm80": [
+			":nnc_cuda_compat_sm80"
+		],
+		"//conditions:default": []
+	})
+)
+
+objc_library(
+	name = "cmd_mps",
+	srcs = glob(["nnc/cmd/**/*.h"]),
+	non_arc_srcs = glob(["nnc/cmd/**/*.m"]),
+	includes = [
+		"."
+	],
+	defines = [
+		"HAVE_MPS"
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":nnc_headers",
+		":nnc_mfa_compat",
+		":nnc_mps_compat",
+	]
+)
+
+cc_library(
+	name = "cmd",
+	srcs = glob(["nnc/cmd/**/*.h"]) + glob(["nnc/cmd/**/*.c"]) + [
+		"nnc/cmd/ccv_nnc_cmd.inc"
+	],
+	includes = [
+		"."
+	],
+	copts = ccv_default_copts(),
+	deps = [
+		":nnc_headers",
+		":dSFMT",
+		":ccv_algebra"
+	]
+)
+
+cc_library(
+	name = "nnc",
+	srcs = [
+		"nnc/_ccv_nnc_tensor_tape.h",
+		"nnc/_ccv_nnc_graph.h",
+		"nnc/_ccv_nnc_micro.h",
+		"nnc/_ccv_nnc_symbolic_graph.h",
+		"nnc/_ccv_nnc_dynamic_graph.h",
+		"nnc/_ccv_nnc_xpu_alloc.h",
+		"nnc/_ccv_cnnp_dataframe.h",
+		"nnc/_ccv_cnnp_model.h",
+		"nnc/ccv_nnc_palettize.c",
+		"nnc/ccv_nnc_8i_rowwise.c",
+		"nnc/ccv_nnc_tensor.c",
+		"nnc/ccv_nnc_tensor_io.c",
+		"nnc/ccv_nnc_tensor_tape.c",
+		"nnc/ccv_nnc_cmd.c",
+		"nnc/ccv_nnc_stream.c",
+		"nnc/ccv_nnc_graph.c",
+		"nnc/ccv_nnc_graph_run.c",
+		"nnc/ccv_nnc_graph_while.c",
+		"nnc/ccv_nnc_graph_case_of.c",
+		"nnc/ccv_nnc_micro.c",
+		"nnc/ccv_nnc_micro_core.c",
+		"nnc/ccv_nnc_micro_interpret.c",
+		"nnc/ccv_nnc_micro_simplify.c",
+		"nnc/ccv_nnc_symbolic_graph.c",
+		"nnc/ccv_nnc_symbolic_graph_compile.c",
+		"nnc/ccv_nnc_symbolic_graph_io.c",
+		"nnc/ccv_nnc_symbolic_graph_while.c",
+		"nnc/ccv_nnc_symbolic_graph_case_of.c",
+		"nnc/ccv_nnc_symbolic_graph_backward.c",
+		"nnc/ccv_nnc_symbolic_graph_minimize.c",
+		"nnc/ccv_nnc_symbolic_graph_simplify.c",
+		"nnc/ccv_nnc_symbolic_graph_parallel.c",
+		"nnc/ccv_nnc_symbolic_graph_memory_compression.c",
+		"nnc/ccv_nnc_symbolic_graph_memory_reduction.c",
+		"nnc/ccv_nnc_symbolic_graph_chain_decomposition.c",
+		"nnc/ccv_nnc_xpu_alloc.c",
+		"nnc/ccv_nnc_dynamic_graph.c",
+		"nnc/ccv_nnc_dynamic_graph_alloc.c",
+		"nnc/ccv_nnc_dynamic_graph_evaluate.c",
+		"nnc/ccv_nnc_dynamic_graph_backward.c",
+		"nnc/ccv_nnc_dynamic_graph_minimize.c",
+		"nnc/ccv_nnc_dynamic_graph_apply_gradients.c",
+		"nnc/ccv_cnnp_dataframe.c",
+		"nnc/ccv_cnnp_dataframe_core.c",
+		"nnc/ccv_cnnp_dataframe_addons.c",
+		"nnc/ccv_cnnp_dataframe_csv.c",
+		"nnc/ccv_cnnp_model.c",
+		"nnc/ccv_cnnp_model_io.c",
+		"nnc/ccv_cnnp_model_core.c",
+		"nnc/ccv_cnnp_model_addons.c",
+		"nnc/ccv_cnnp_model_gradient_checkpointing.c",
+	],
+	hdrs = [
+		"nnc/ccv_nnc.h",
+		"nnc/ccv_nnc_internal.h",
+		"nnc/ccv_nnc_easy.h"
+	],
+	visibility = ["//visibility:public"],
+	copts = ccv_default_copts(),
+	tags = ["swift_module=C_nnc"],
+	deps = [
+		":nnc_headers",
+		":ccv_util",
+		":ccv_output",
+		":ccv_image_processing",
+		":ccv_basic",
+		":ccv_resample",
+		":ccv_numeric",
+		":ccv_io",
+		":cmd",
+		":sqlite3_hdrs",
+		":khash",
+		":jemalloc",
+		":SFMT"
+	] + select({
+		"//config:have_cuda": [
+			":nnc_cuda_compat",
+			":cmd_cuda"
+		],
+		"//conditions:default": []
+	}) + select({
+		"//config:have_cuda_sm80": [
+			":nnc_cuda_compat_sm80"
+		],
+		"//conditions:default": []
+	}) + select({
+		"//config:have_mps": [
+			":nnc_mfa_compat",
+			":nnc_mps_compat",
+			":cmd_mps"
+		],
+		"//conditions:default": []
+	}) + select({
+		":linux_build": ["@sqlite3//:SQLite3"],
+		"//conditions:default": []
+	})
+)

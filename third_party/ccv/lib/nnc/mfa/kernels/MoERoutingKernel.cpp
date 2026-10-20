@@ -1,0 +1,153 @@
+#include "MoERoutingKernel.hpp"
+#include "../ccv_nnc_mfa.hpp"
+#include "CodeWriter.hpp"
+
+static const char* _ccv_nnc_moe_routing_type_name(const uint32_t data_type)
+{
+	switch (data_type)
+	{
+		case 3:
+			return "float";
+		case 16:
+			return "half";
+		case 121:
+			return "bfloat";
+		default:
+			CCV_NNC_MFA_PRECONDITION(false);
+			return nullptr;
+	}
+}
+
+MoERoutingKernel::MoERoutingKernel(MoERoutingKernelDescriptor descriptor, MTL::Device* const device)
+{
+	const char* const activation_type = _ccv_nnc_moe_routing_type_name(descriptor.activationDataType);
+	const char* const routing_type = _ccv_nnc_moe_routing_type_name(descriptor.routingDataType);
+	CodeWriter source;
+	source.SetValue("ACTIVATION_TYPE", activation_type);
+	source.SetValue("ROUTING_TYPE", routing_type);
+	source.SetValue("SIMD_GROUPS", std::to_string(descriptor.executionSIMDGroups));
+	source += R"(
+#include <metal_stdlib>
+using namespace metal;
+
+typedef {{ACTIVATION_TYPE}} activation_t;
+typedef {{ROUTING_TYPE}} routing_t;
+
+constant uint expert_count [[function_constant(0)]];
+constant uint kth [[function_constant(1)]];
+constant uint hidden [[function_constant(2)]];
+constant float weight_scale [[function_constant(3)]];
+constant bool preselected [[function_constant(4)]];
+constant bool single_input_token [[function_constant(5)]];
+constant float normalization_epsilon [[function_constant(6)]];
+constant bool sigmoid_scoring [[function_constant(7)]];
+
+inline float stable_log1p(float x)
+{
+	const float xp1 = 1.0f + x;
+	if (xp1 == 1.0f)
+		return x;
+	return x * (precise::log(xp1) / (xp1 - 1.0f));
+}
+
+inline float routing_probability(float x)
+{
+	if (sigmoid_scoring)
+		return 1.0f / (1.0f + precise::exp(-x));
+	const float positive = x > 0.0f ? x : 0.0f;
+	return sqrt(positive + stable_log1p(precise::exp(-abs(x))));
+}
+
+kernel void moe_routing_t1(
+	device const routing_t* logits [[buffer(0)]],
+	device const char* route [[buffer(1)]],
+	device const activation_t* activation [[buffer(2)]],
+	device activation_t* gathered [[buffer(3)]],
+	device float* route_weights [[buffer(4)]],
+	device int* token_indices [[buffer(5)]],
+	device int* expert_indices [[buffer(6)]],
+	device int* expert_counts [[buffer(7)]],
+	threadgroup float* probabilities [[threadgroup(0)]],
+	uint tid [[thread_index_in_threadgroup]],
+	uint lane [[thread_index_in_simdgroup]],
+	uint simd_group [[simdgroup_index_in_threadgroup]],
+	uint ntg [[threads_per_threadgroup]])
+{
+	threadgroup float group_scores[{{SIMD_GROUPS}}];
+	threadgroup uint group_experts[{{SIMD_GROUPS}}];
+	threadgroup uint top_experts[32];
+	for (uint expert = tid; expert < expert_count; expert += ntg)
+		probabilities[expert] = routing_probability((float)logits[expert]);
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+
+	if (preselected)
+	{
+		if (tid == 0)
+		{
+			device const int* selected = (device const int*)route;
+			for (uint slot = 0; slot < kth; slot++)
+				top_experts[slot] = (uint)selected[slot];
+		}
+	} else {
+		float candidate_score = tid < expert_count ? probabilities[tid] + (float)((device const routing_t*)route)[tid] : -INFINITY;
+		for (uint slot = 0; slot < kth; slot++)
+		{
+			const float simd_score = simd_max(candidate_score);
+			const uint candidate_expert = candidate_score == simd_score ? tid : 0xffffffffu;
+			const uint simd_expert = simd_min(candidate_expert);
+			if (lane == 0)
+			{
+				group_scores[simd_group] = simd_score;
+				group_experts[simd_group] = simd_expert;
+			}
+			threadgroup_barrier(mem_flags::mem_threadgroup);
+			if (simd_group == 0)
+			{
+				const uint simd_groups = (ntg + 31) / 32;
+				const float group_score = lane < simd_groups ? group_scores[lane] : -INFINITY;
+				const float best_score = simd_max(group_score);
+				const uint group_expert = group_score == best_score ? group_experts[lane] : 0xffffffffu;
+				const uint best_expert = simd_min(group_expert);
+				if (lane == 0)
+					top_experts[slot] = best_expert;
+			}
+			threadgroup_barrier(mem_flags::mem_threadgroup);
+			if (tid == top_experts[slot])
+				candidate_score = -INFINITY;
+		}
+	}
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+
+	if (tid == 0)
+	{
+		float selected_sum = 0.0f;
+		for (uint slot = 0; slot < kth; slot++)
+			selected_sum += probabilities[top_experts[slot]];
+		const float denominator = normalization_epsilon > 0 ? selected_sum + normalization_epsilon : max(selected_sum, 6.103515625e-5f);
+		const float selected_scale = weight_scale / denominator;
+		for (uint slot = 0; slot < kth; slot++)
+		{
+			const uint expert = top_experts[slot];
+			route_weights[slot] = probabilities[expert] * selected_scale;
+			token_indices[slot] = 0;
+			expert_indices[slot] = (int)expert;
+			expert_counts[slot] = 1;
+		}
+	}
+
+	if (single_input_token)
+	{
+		for (uint index = tid; index < hidden; index += ntg)
+			gathered[index] = activation[index];
+	} else {
+		const uint gathered_count = kth * hidden;
+		for (uint index = tid; index < gathered_count; index += ntg)
+			gathered[index] = activation[index % hidden];
+	}
+}
+)";
+	const std::string shader = source.ToString();
+	NS::Error* error = nil;
+	library = NS::TransferPtr(device->newLibrary(NS::String::string(shader.c_str(), NS::UTF8StringEncoding), nil, &error));
+	CCV_NNC_MFA_CHECK_ERROR(error);
+}
