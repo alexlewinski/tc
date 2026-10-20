@@ -330,6 +330,8 @@ impl Flux2Engine {
         }
         t.touched = touched.into_iter().collect();
         t.applied = loras.to_vec();
+        // Weights were rewritten in place on the stream; finish before sampling reads them.
+        self.graph.synchronize();
         Ok(())
     }
 

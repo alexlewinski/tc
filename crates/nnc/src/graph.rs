@@ -408,9 +408,11 @@ impl Var {
         let out = self.graph().empty_with_format(device, self.format(), self.dtype(), &self.shape());
         crate::ops::data_transfer(&src, &out);
         if src.device() == Device::Cpu && !self.graph().stream().is_null() {
-            // The copy may still be in flight on the GPU stream: keep the host buffer alive for
-            // as long as the destination exists.
-            return out.with_keepalive(src);
+            // The copy is queued on the GPU stream and reads the host buffer later. Keeping the
+            // buffer alive only as long as `out` is not enough (a temporary `out` can be dropped
+            // before the copy runs and the host memory reused), so wait for the copy here.
+            // Uploads are weights, LoRA factors and small per-step tensors: the stall is cheap.
+            self.graph().synchronize();
         }
         out
     }

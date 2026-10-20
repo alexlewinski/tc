@@ -40,6 +40,11 @@ fn error(got: &[f32], exp: &[f32]) -> (f32, f32, usize) {
 /// (max, mean, non-finite pixels) of one generation against `expected_file`; `embeddings`
 /// replaces the text encoder.
 fn run(device: Device, precision: Precision, with_ref: bool, expected_file: &str, embeddings: Option<&HostTensor>) -> (f32, f32, usize) {
+    error(&generate(device, precision, with_ref, true, embeddings), &expected(expected_file))
+}
+
+/// One generation (pixels in `[0, 1]`, non-finite values kept).
+fn generate(device: Device, precision: Precision, with_ref: bool, with_loras: bool, embeddings: Option<&HostTensor>) -> Vec<f32> {
     let store = ModelStore::new(vec![fixtures()]);
     let config = GenerationConfiguration {
         model: Some("tiny-klein".into()),
@@ -51,10 +56,14 @@ fn run(device: Device, precision: Precision, with_ref: bool, expected_file: &str
         strength: 1.0,
         sampler: tc_config::SamplerType::DDIMTrailing as i8,
         resolution_dependent_shift: true,
-        loras: vec![
-            LoRA { file: Some("lora_a.safetensors".into()), weight: 0.8, mode: 0 },
-            LoRA { file: Some("lora_b.safetensors".into()), weight: 0.5, mode: 0 },
-        ],
+        loras: if with_loras {
+            vec![
+                LoRA { file: Some("lora_a.safetensors".into()), weight: 0.8, mode: 0 },
+                LoRA { file: Some("lora_b.safetensors".into()), weight: 0.5, mode: 0 },
+            ]
+        } else {
+            vec![]
+        },
         ..Default::default()
     };
     let references = if with_ref { vec![tc_core::image_io::load_rgb(&fixtures().join("ref.png")).unwrap()] } else { vec![] };
@@ -64,8 +73,7 @@ fn run(device: Device, precision: Precision, with_ref: bool, expected_file: &str
     let (mut engine, _) = engine(device, precision);
     let out = engine.generate(&params, &Cancellation::default(), &mut |_| true).unwrap();
     // NaN must survive the clamp so it is counted.
-    let got: Vec<f32> = out.images[0].to_f32_vec().iter().map(|v| if v.is_finite() { (v / 2.0 + 0.5).clamp(0.0, 1.0) } else { *v }).collect();
-    error(&got, &expected(expected_file))
+    out.images[0].to_f32_vec().iter().map(|v| if v.is_finite() { (v / 2.0 + 0.5).clamp(0.0, 1.0) } else { *v }).collect()
 }
 
 /// The same request on CPU matches diffusers (checks this harness).
@@ -113,7 +121,16 @@ fn gpu_precision_matrix() {
             failures.push(format!("text embeddings {label}: max {max:.4}, non-finite {nans}"));
         }
     }
-    // Stage 2: generation with the CPU embeddings (no text encoder on GPU).
+    // Stage 2a: no LoRAs, CPU embeddings: GPU vs the same generation on CPU.
+    let f32p = p(F32, F32, F32);
+    let cpu_img = generate(Device::Cpu, f32p, true, false, Some(&cpu_emb));
+    let gpu_img = generate(Device::Gpu(0), f32p, true, false, Some(&cpu_emb));
+    let (max, mean, nans) = error(&gpu_img, &cpu_img);
+    eprintln!("gpu no-lora vs cpu (f32, ref): max error {max:.4}, mean error {mean:.5}, non-finite {nans}");
+    if nans > 0 || max > 3.0 / 255.0 {
+        failures.push(format!("no-lora vs cpu: max {max:.4}, non-finite {nans}"));
+    }
+    // Stage 2b: generation with the CPU embeddings (no text encoder on GPU).
     for (label, precision, with_ref, bound) in [
         ("cpu-emb f32/-/f32 no-ref", p(F32, F32, F32), false, 3.0 / 255.0),
         ("cpu-emb f32/-/f32 ref", p(F32, F32, F32), true, 3.0 / 255.0),
