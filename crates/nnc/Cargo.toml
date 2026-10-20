@@ -13,3 +13,4 @@ thiserror = "2"
 
 [dev-dependencies]
 approx = "0.5"
+safetensors = "0.4"
