@@ -126,6 +126,20 @@ checked in, so Python isn't needed to run the tests). End-to-end tests drive a t
 [klein] snapshot with two LoRAs, with and without a reference image, through the real
 `draw-things-cli` binary and through a gRPC server and client.
 
+### Checking Metal on your Mac
+
+GitHub's macOS runners are virtual machines without Metal Performance Shaders, so CI checks the
+Metal build but not Metal numerics. On an Apple Silicon Mac:
+
+```sh
+cargo run -q -p nnc --example devices    # should list one GPU
+NNC_TEST_DEVICE=gpu cargo test -p nnc -p tc-core -p draw-things-cli -- --test-threads=1
+```
+
+This compares each op and model on Metal with the PyTorch references, and runs the reference
+image + two LoRAs case through `draw-things-cli` on the GPU in f32, f16, bf16 and `--quantize`,
+printing the error of each against diffusers.
+
 With the same seed, outputs match `diffusers`' `Flux2KleinPipeline` (the initial noise
 reproduces `torch.randn` on CPU).
 
