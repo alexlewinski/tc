@@ -131,8 +131,8 @@ checked in, so Python isn't needed to run the tests). End-to-end tests drive a t
 
 ### Checking Metal on your Mac
 
-GitHub's macOS runners are virtual machines without Metal Performance Shaders, so CI checks the
-Metal build but not Metal numerics. On an Apple Silicon Mac:
+CI runs these GPU tests on GitHub's Apple Silicon runners (virtual machines with a Metal
+device). To run them on your own Mac:
 
 ```sh
 cargo run -q -p nnc --example devices    # should list one GPU

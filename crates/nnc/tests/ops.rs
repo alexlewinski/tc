@@ -216,3 +216,21 @@ fn palettize_roundtrip() {
     assert!(v.is_quantized());
     assert_eq!(v.shape(), vec![200, 200]);
 }
+
+/// The f16 kernels the VAE uses on GPU (group norm with scale/bias, layer / RMS norm).
+/// GPU only: nnc's CPU kernels are f32.
+#[test]
+fn norms_f16_gpu() {
+    if !device().is_gpu() {
+        return;
+    }
+    let fx = Fixtures::load();
+    let g = Graph::new();
+    let h = |name: &str| fx.var(&g, name).to_dtype(DataType::F16);
+    let x = h("ln.x");
+    let (gm, bt) = (h("ln.g"), h("ln.b"));
+    check(&fx, &ops::layer_norm(&x, &[2], 1e-5, Some((&gm, &bt))).to_dtype(DataType::F32), "ln_affine.out", 2e-2);
+    check(&fx, &ops::rms_norm(&x, &[2], 1e-6, Some(&gm)).to_dtype(DataType::F32), "rms.out", 2e-2);
+    let (xg, gg, gb) = (h("gn.x"), h("gn.g"), h("gn.b"));
+    check(&fx, &ops::group_norm(&xg, 3, 8, &[1, 2], 1e-6, Some((&gg, &gb))).to_dtype(DataType::F32), "gn.out", 2e-2);
+}
