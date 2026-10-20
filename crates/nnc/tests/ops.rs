@@ -116,16 +116,38 @@ fn activations() {
     check(&fx, &ops::exp(&x), "act.exp", 1e-4);
 }
 
+/// Fixtures store CPU-layout weights `[O, kh, kw, I]`; GPU kernels want `[O, I, kh, kw]` (NCHW).
+fn conv_weight(fx: &Fixtures, g: &Graph, name: &str) -> Var {
+    let h = fx.get(name);
+    if device() == Device::Cpu {
+        return g.from_host(&h, Device::Cpu);
+    }
+    let s = h.shape().to_vec();
+    let (o, kh, kw, i) = (s[0], s[1], s[2], s[3]);
+    let v = h.to_f32_vec();
+    let mut out = vec![0f32; v.len()];
+    for a in 0..o {
+        for b in 0..i {
+            for y in 0..kh {
+                for x in 0..kw {
+                    out[((a * i + b) * kh + y) * kw + x] = v[((a * kh + y) * kw + x) * i + b];
+                }
+            }
+        }
+    }
+    g.from_host_with_format(&HostTensor::from_f32(&out, &[o, i, kh, kw]), device(), nnc::Format::Nchw)
+}
+
 #[test]
 fn convolution_and_upsample() {
     let fx = Fixtures::load();
     let g = Graph::new();
     let x = fx.var(&g, "conv.x");
-    let w3 = fx.var(&g, "conv.w3");
+    let w3 = conv_weight(&fx, &g, "conv.w3");
     let b3 = fx.var(&g, "conv.b3");
     check(&fx, &ops::conv2d(&x, &w3, Some(&b3), (1, 1), (1, 1, 1, 1), 1), "conv.out3", 1e-4);
     check(&fx, &ops::conv2d(&x, &w3, Some(&b3), (2, 2), (0, 1, 0, 1), 1), "conv.out3s2", 1e-4);
-    let w1 = fx.var(&g, "conv.w1");
+    let w1 = conv_weight(&fx, &g, "conv.w1");
     let b1 = fx.var(&g, "conv.b1");
     check(&fx, &ops::conv2d(&x, &w1, Some(&b1), (1, 1), (0, 0, 0, 0), 1), "conv.out1", 1e-4);
     check(&fx, &ops::upsample(&x, 2.0, 2.0, false), "up.out", 0.0);

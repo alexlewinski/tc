@@ -7,7 +7,7 @@ use tc_core::weights::SafeTensorsFiles;
 #[test]
 fn vae_decode_encode_pack_match_reference() {
     let g = Graph::new();
-    let vae = Flux2Vae::load(&g, &fixture("vae/vae"), Device::Cpu, DataType::F32).unwrap();
+    let vae = Flux2Vae::load(&g, &fixture("vae/vae"), device(), DataType::F32).unwrap();
     let io = SafeTensorsFiles::open(&[fixture("vae/vae_io.safetensors")]).unwrap();
     let z = load(&g, &io, "z");
     let dec = vae.decode_raw(&z);

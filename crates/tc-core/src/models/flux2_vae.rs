@@ -90,13 +90,19 @@ impl Flux2Vae {
                 continue;
             }
             let info = files.info(key).unwrap();
-            let host = if info.shape.len() == 4 {
-                let (w, s) = conv_weight_to_nhwc(&files.read_f32(key)?, &info.shape);
-                nnc::HostTensor::from_f32(&w, &s)
+            let v = if info.shape.len() == 4 {
+                if device.is_gpu() {
+                    // GPU convolution kernels take PyTorch's OIHW layout (tagged NCHW).
+                    let host = files.read(key, dtype)?;
+                    graph.from_host_with_format(&host, device, nnc::Format::Nchw)
+                } else {
+                    let (w, s) = conv_weight_to_nhwc(&files.read_f32(key)?, &info.shape);
+                    upload(graph, &nnc::HostTensor::from_f32(&w, &s), device, dtype)
+                }
             } else {
-                files.read(key, DataType::F32)?
+                upload(graph, &files.read(key, DataType::F32)?, device, dtype)
             };
-            params.insert(name.to_string(), upload(graph, &host, device, dtype));
+            params.insert(name.to_string(), v);
         }
         let mean = files.read_f32(&format!("{prefix}bn.running_mean")).context("vae bn.running_mean")?;
         let var = files.read_f32(&format!("{prefix}bn.running_var")).context("vae bn.running_var")?;

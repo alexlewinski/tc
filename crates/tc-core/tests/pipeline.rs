@@ -8,7 +8,7 @@ use tc_core::weights::SafeTensorsFiles;
 fn engine(distilled: bool) -> Flux2Engine {
     let dir = fixture("pipeline");
     let mut e = Flux2Engine::new(EngineOptions {
-        device: Device::Cpu,
+        device: device(),
         precision: Precision::default_for(Device::Cpu),
         keep_text_encoder: false,
         prompt_cache_size: 0,

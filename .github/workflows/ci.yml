@@ -36,7 +36,7 @@ jobs:
         continue-on-error: true   # hosted runners may not expose a usable Metal device
         run: |
           cargo run -q -p nnc --example devices
-          NNC_TEST_DEVICE=gpu cargo test -p nnc --test ops -- --test-threads=1
+          NNC_TEST_DEVICE=gpu cargo test -p nnc -p tc-core -- --test-threads=1
       - name: Release build
         run: cargo build --release -p draw-things-cli -p grpc-server-cli
       - uses: actions/upload-artifact@v4

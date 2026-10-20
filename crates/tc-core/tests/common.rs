@@ -6,8 +6,16 @@ pub fn fixture(path: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(path)
 }
 
+/// Device under test: `NNC_TEST_DEVICE=gpu` runs the model tests on the GPU (in f32).
+pub fn device() -> Device {
+    match std::env::var("NNC_TEST_DEVICE").as_deref() {
+        Ok("gpu") => Device::Gpu(0),
+        _ => Device::Cpu,
+    }
+}
+
 pub fn load(g: &Graph, files: &SafeTensorsFiles, name: &str) -> Var {
-    g.from_host(&files.read(name, DataType::F32).unwrap(), Device::Cpu)
+    g.from_host(&files.read(name, DataType::F32).unwrap(), device())
 }
 
 #[track_caller]

@@ -354,7 +354,11 @@ pub fn concat(inputs: &[&Var], axis: usize) -> Var {
     out
 }
 
-/// 2-D convolution on NHWC input `[N, H, W, Cin]` with weight `[Cout, kh, kw, Cin/groups]`.
+/// 2-D convolution on NHWC input `[N, H, W, Cin]`.
+///
+/// The weight layout depends on the device backend: CPU kernels take `[Cout, kh, kw, Cin/groups]`
+/// tagged NHWC, GPU kernels take PyTorch's `[Cout, Cin/groups, kh, kw]` tagged NCHW. Both are
+/// accepted here; the kernel size is read according to the weight's format.
 pub fn conv2d(
     x: &Var,
     w: &Var,
@@ -364,12 +368,16 @@ pub fn conv2d(
     groups: usize,
 ) -> Var {
     let ws = w.shape();
-    assert_eq!(ws.len(), 4, "conv2d weight must be [Cout, kh, kw, Cin]");
+    assert_eq!(ws.len(), 4, "conv2d weight must be 4-D");
+    let (kh, kw, cin) = match w.format() {
+        crate::types::Format::Nchw => (ws[2], ws[3], ws[1]),
+        crate::types::Format::Nhwc => (ws[1], ws[2], ws[3]),
+    };
     let mut p = base_params();
     p.size.dim = [0; MAX_DIM];
-    p.size.dim[0] = ws[1] as i32;
-    p.size.dim[1] = ws[2] as i32;
-    p.size.dim[2] = ws[3] as i32;
+    p.size.dim[0] = kh as i32;
+    p.size.dim[1] = kw as i32;
+    p.size.dim[2] = cin as i32;
     p.__bindgen_anon_1.convolution.count = ws[0] as i32;
     p.__bindgen_anon_1.convolution.groups = groups as i32;
     let mut dilation = [0; MAX_DIM];

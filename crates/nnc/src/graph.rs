@@ -119,7 +119,12 @@ impl Graph {
 
     /// Upload host data to a new variable on `device`.
     pub fn from_host(&self, host: &HostTensor, device: Device) -> Var {
-        let cpu = self.empty(Device::Cpu, host.dtype(), host.shape());
+        self.from_host_with_format(host, device, Format::Nhwc)
+    }
+
+    /// Upload host data, tagging it with a layout `format` (e.g. NCHW for OIHW conv weights).
+    pub fn from_host_with_format(&self, host: &HostTensor, device: Device, format: Format) -> Var {
+        let cpu = self.empty_with_format(Device::Cpu, format, host.dtype(), host.shape());
         unsafe {
             let t = sys::ccv_nnc_tensor_from_variable_impl(self.inner.raw, cpu.raw(), std::ptr::null_mut());
             assert!(!t.is_null());

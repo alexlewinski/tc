@@ -8,7 +8,7 @@ use tc_core::weights::SafeTensorsFiles;
 fn run(dir: &str, source_path: &str, with_lora: bool, guidance: Option<f32>) {
     let g = Graph::new();
     let (source, config) = open_source(&fixture(dir).join(source_path)).unwrap();
-    let mut model = Flux2::load(&g, &source, config.clone(), Device::Cpu, DataType::F32, false).unwrap();
+    let mut model = Flux2::load(&g, &source, config.clone(), device(), DataType::F32, false).unwrap();
     let io = SafeTensorsFiles::open(&[fixture(dir).join("flux2_io.safetensors")]).unwrap();
     if with_lora {
         let resolver = Flux2LoraResolver { config: config.clone() };
@@ -25,7 +25,7 @@ fn run(dir: &str, source_path: &str, with_lora: bool, guidance: Option<f32>) {
     ids.extend(image_ids(4, 4, 0.0));
     ids.extend(image_ids(2, 2, 10.0));
     let (rope, shape) = rope_table(&ids, &config.axes_dims_rope, config.rope_theta);
-    let rope = g.from_f32(&rope, &shape, Device::Cpu, DataType::F32);
+    let rope = g.from_f32(&rope, &shape, device(), DataType::F32);
     let gv = guidance.map(|v| vec![v * 1000.0]);
     let step = model.prepare_step(&[700.0], gv.as_deref());
     let y = model.forward(&x, &ctx, &step, &rope);
@@ -59,7 +59,7 @@ fn flux2_runtime_lora_adapters_match_merged() {
     let dir = "flux2";
     let g = Graph::new();
     let (source, config) = open_source(&fixture(dir).join("transformer")).unwrap();
-    let mut model = Flux2::load(&g, &source, config.clone(), Device::Cpu, DataType::F32, true).unwrap();
+    let mut model = Flux2::load(&g, &source, config.clone(), device(), DataType::F32, true).unwrap();
     let resolver = Flux2LoraResolver { config: config.clone() };
     for (file, w) in [("lora_peft.safetensors", 0.8), ("lora_bfl.safetensors", 0.5)] {
         let f = LoraFile::open(&fixture(dir).join(file)).unwrap();
@@ -76,7 +76,7 @@ fn flux2_runtime_lora_adapters_match_merged() {
     ids.extend(image_ids(4, 4, 0.0));
     ids.extend(image_ids(2, 2, 10.0));
     let (rope, shape) = rope_table(&ids, &config.axes_dims_rope, config.rope_theta);
-    let rope = g.from_f32(&rope, &shape, Device::Cpu, DataType::F32);
+    let rope = g.from_f32(&rope, &shape, device(), DataType::F32);
     let step = model.prepare_step(&[700.0], None);
     let y = model.forward(&x, &ctx, &step, &rope);
     assert_close(&y.to_f32_vec(), &io.read_f32("out_lora").unwrap(), 1e-4, "runtime adapters");
