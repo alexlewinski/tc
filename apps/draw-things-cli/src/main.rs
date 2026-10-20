@@ -236,6 +236,9 @@ struct GenerateArgs {
     /// Run on CPU even if a GPU is available.
     #[arg(long)]
     cpu: bool,
+    /// Store transformer / text encoder weights 8-bit palettized (about half the memory).
+    #[arg(long)]
+    quantize: bool,
 }
 
 fn main() {
@@ -583,7 +586,7 @@ fn generate_local(a: &GenerateArgs, store: &ModelStore, prepared: Prepared) -> R
     if let Some(p) = &a.text_encoder_precision {
         precision.text_encoder = parse_dtype(p)?;
     }
-    let worker = Arc::new(Worker::spawn(store.clone(), EngineOptions { device, precision, keep_text_encoder: false, prompt_cache_size: 0 }));
+    let worker = Arc::new(Worker::spawn(store.clone(), EngineOptions { device, precision, keep_text_encoder: false, prompt_cache_size: 0, quantize: a.quantize }));
     let input = GenerationInput {
         config: prepared.config,
         prompt: prepared.prompt,

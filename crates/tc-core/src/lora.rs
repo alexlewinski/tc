@@ -233,6 +233,95 @@ pub fn merge(params: &mut Params, resolver: &dyn TargetResolver, lora: &LoraFile
     Ok(report)
 }
 
+/// A LoRA kept separate from the base weight (used when weights are quantized):
+/// `y[.., row_offset..row_offset+rows] += up @ (down @ x)`, with the strength folded into `up`.
+#[derive(Clone)]
+pub struct Adapter {
+    pub down: Var,
+    pub up: Var,
+    pub row_offset: usize,
+    pub rows: usize,
+}
+
+/// Build runtime adapters for `lora` (scaled by `weight`). Returns `(param, adapter)` pairs.
+pub fn adapters(
+    params: &Params,
+    resolver: &dyn TargetResolver,
+    lora: &LoraFile,
+    weight: f32,
+) -> Result<(Vec<(String, Adapter)>, MergeReport)> {
+    let kohya = kohya_map(resolver);
+    let mut report = MergeReport::default();
+    let mut out = vec![];
+    for u in &lora.updates {
+        let mut module = u.module.as_str();
+        if let Some(rest) = module.strip_prefix("lora_unet_") {
+            match kohya.get(rest) {
+                Some(m) => module = m.as_str(),
+                None => {
+                    report.unmatched.push(u.module.clone());
+                    continue;
+                }
+            }
+        }
+        let targets = resolver.resolve(module);
+        let Some(down) = &u.down else {
+            report.unmatched.push(format!("{} (full diff not supported with quantized weights)", u.module));
+            continue;
+        };
+        if targets.is_empty() {
+            report.unmatched.push(u.module.clone());
+            continue;
+        }
+        for target in targets {
+            let Some(w) = params.try_get(&target.param) else {
+                report.unmatched.push(u.module.clone());
+                continue;
+            };
+            let ws = w.shape();
+            let rank = down.shape()[0];
+            let rows = target.rows.unwrap_or(ws[0]);
+            anyhow::ensure!(u.up.shape()[0] == rows && down.shape()[1] == ws[1], "LoRA {} does not fit {}", u.module, target.param);
+            let scale = weight * u.alpha.map(|a| a / rank as f32).unwrap_or(1.0);
+            let mut up = u.up.to_f32_vec().iter().map(|v| v * scale).collect::<Vec<f32>>();
+            if target.swap_halves {
+                let h = rows / 2 * rank;
+                up.rotate_left(h);
+            }
+            let graph = w.graph().clone();
+            let device = w.device();
+            let dtype = if device.is_gpu() { w.dtype() } else { DataType::F32 };
+            let up = graph.from_f32(&up, &[rows, rank], device, dtype);
+            let down = upload(&graph, down, device, dtype);
+            out.push((target.param.clone(), Adapter { down, up, row_offset: target.row_offset, rows }));
+            report.touched.insert(target.param.clone());
+            report.applied += 1;
+        }
+    }
+    Ok((out, report))
+}
+
+/// `x @ w^T` plus any runtime adapters for this weight.
+pub fn linear_with_adapters(x: &Var, w: &Var, adapters: Option<&Vec<Adapter>>) -> Var {
+    let out = ops::linear(x, w, None);
+    let Some(adapters) = adapters else { return out };
+    let last = out.rank() - 1;
+    let out_dim = out.dim(last);
+    let mut out = out;
+    for a in adapters {
+        let t = ops::linear(x, &a.down, None);
+        let u = ops::linear(&t, &a.up, None);
+        if a.rows == out_dim {
+            out = ops::add(&out, &u);
+        } else {
+            let slice = out.narrow(last, a.row_offset, a.rows);
+            let sum = ops::add(&slice, &u);
+            slice.assign(&sum);
+        }
+    }
+    out
+}
+
 fn apply_update(w: &Var, u: &LoraUpdate, target: &LoraTarget, weight: f32) -> Result<()> {
     let graph = w.graph().clone();
     let device = w.device();

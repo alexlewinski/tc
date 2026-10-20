@@ -1584,6 +1584,7 @@ dependencies = [
  "bytemuck",
  "half",
  "nnc-sys",
+ "rayon",
  "safetensors",
  "thiserror 2.0.21",
 ]

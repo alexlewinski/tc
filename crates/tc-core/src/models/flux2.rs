@@ -18,7 +18,9 @@ use anyhow::{bail, Context, Result};
 use nnc::{ops, DataType, Device, Graph, HostTensor, Var};
 use serde::Deserialize;
 
-use crate::lora::{LoraTarget, TargetResolver};
+use std::collections::HashMap;
+
+use crate::lora::{linear_with_adapters, Adapter, LoraTarget, TargetResolver};
 use crate::weights::{upload, Params, SafeTensorsFiles};
 
 /// Architecture hyper-parameters (diffusers `config.json` field names).
@@ -429,6 +431,29 @@ pub struct Flux2 {
     pub params: Params,
     pub device: Device,
     pub dtype: DataType,
+    /// Linear weights stored 8-bit palettized.
+    pub quantized: bool,
+    /// Runtime (unmerged) LoRA adapters per parameter.
+    pub adapters: HashMap<String, Vec<Adapter>>,
+}
+
+/// Linear weights at least this large are quantized in 8-bit mode.
+const QUANTIZE_MIN_ELEMENTS: usize = 1 << 16;
+
+/// Upload a weight, palettizing large matrices when `quantize` is set. On CPU the palettized
+/// values are expanded back to floats (same numerics, no memory saving).
+pub fn upload_weight(graph: &Graph, host: &HostTensor, device: Device, dtype: DataType, quantize: bool) -> Var {
+    if quantize && host.shape().len() == 2 && host.numel() >= QUANTIZE_MIN_ELEMENTS {
+        let src_dtype = if dtype == DataType::F32 { DataType::F16 } else { dtype };
+        let h = host.to_dtype(src_dtype);
+        let q = nnc::quant::palettize8_fast(&h, nnc::quant::DEFAULT_BLOCK);
+        if device.is_gpu() {
+            return graph.from_palettized(&q, src_dtype, host.shape(), 8, nnc::quant::DEFAULT_BLOCK, device);
+        }
+        let back = nnc::quant::depalettize(&q, src_dtype, host.shape(), 8, nnc::quant::DEFAULT_BLOCK);
+        return upload(graph, &back, device, dtype);
+    }
+    upload(graph, host, device, dtype)
 }
 
 /// Sinusoidal timestep embedding (`flip_sin_to_cos=True`, `downscale_freq_shift=0`).
@@ -491,20 +516,24 @@ pub struct Flux2Step {
 
 impl Flux2 {
     /// Upload all weights from `source`.
-    pub fn load(graph: &Graph, source: &Flux2Source, config: Flux2Config, device: Device, dtype: DataType) -> Result<Flux2> {
+    pub fn load(graph: &Graph, source: &Flux2Source, config: Flux2Config, device: Device, dtype: DataType, quantize: bool) -> Result<Flux2> {
         let mut params = Params::new();
         for name in config.parameter_names() {
-            let host = source.read(&name, dtype).with_context(|| format!("loading {name}"))?;
-            params.insert(name, upload(graph, &host, device, dtype));
+            let host = source.read(&name, if dtype == DataType::F32 { DataType::F32 } else { dtype }).with_context(|| format!("loading {name}"))?;
+            params.insert(name, upload_weight(graph, &host, device, dtype, quantize));
         }
-        Ok(Flux2 { config, params, device, dtype })
+        Ok(Flux2 { config, params, device, dtype, quantized: quantize, adapters: HashMap::new() })
     }
 
     /// Re-read one parameter from the source (used to undo LoRA merges).
     pub fn reload_param(&mut self, graph: &Graph, source: &Flux2Source, name: &str) -> Result<()> {
         let host = source.read(name, self.dtype)?;
-        self.params.insert(name.to_string(), upload(graph, &host, self.device, self.dtype));
+        self.params.insert(name.to_string(), upload_weight(graph, &host, self.device, self.dtype, self.quantized));
         Ok(())
+    }
+
+    fn lin(&self, x: &Var, name: &str) -> Var {
+        linear_with_adapters(x, self.params.get(name), self.adapters.get(name))
     }
 
     fn graph(&self) -> &Graph {
@@ -512,7 +541,7 @@ impl Flux2 {
     }
 
     fn modulation(&self, temb_act: &Var, name: &str, sets: usize) -> Vec<Var> {
-        let m = ops::linear(temb_act, self.params.get(&format!("{name}.weight")), None);
+        let m = self.lin(temb_act, &format!("{name}.weight"));
         let dim = self.config.inner_dim();
         let b = m.dim(0);
         let m = m.reshape(&[b, 1, 3 * sets * dim]);
@@ -551,9 +580,9 @@ impl Flux2 {
     }
 
     fn mlp_embed(&self, x: &Var, name: &str) -> Var {
-        let h = ops::linear(x, self.params.get(&format!("{name}.in_layer.weight")), None);
+        let h = self.lin(x, &format!("{name}.in_layer.weight"));
         let h = ops::silu(&h);
-        ops::linear(&h, self.params.get(&format!("{name}.out_layer.weight")), None)
+        self.lin(&h, &format!("{name}.out_layer.weight"))
     }
 
     fn modulate(&self, x: &Var, shift: &Var, scale1p: &Var) -> Var {
@@ -592,12 +621,12 @@ impl Flux2 {
     }
 
     fn swiglu_mlp(&self, x: &Var, w_in: &str, w_out: &str) -> Var {
-        let h = ops::linear(x, self.params.get(w_in), None);
+        let h = self.lin(x, w_in);
         let m = h.dim(2) / 2;
         let a = h.narrow(2, 0, m).contiguous();
         let gate = h.narrow(2, m, m).contiguous();
         let h = ops::mul(&ops::silu(&a), &gate);
-        ops::linear(&h, self.params.get(w_out), None)
+        self.lin(&h, w_out)
     }
 
     fn double_block(&self, i: usize, img: Var, txt: Var, step: &Flux2Step, rope: &Var) -> (Var, Var) {
@@ -606,8 +635,8 @@ impl Flux2 {
         let tm = &step.txt_mod;
         let img_n = self.modulate(&img, &im[0], &im[1]);
         let txt_n = self.modulate(&txt, &tm[0], &tm[1]);
-        let iqkv = ops::linear(&img_n, self.params.get(&format!("{p}.img_attn.qkv.weight")), None);
-        let tqkv = ops::linear(&txt_n, self.params.get(&format!("{p}.txt_attn.qkv.weight")), None);
+        let iqkv = self.lin(&img_n, &format!("{p}.img_attn.qkv.weight"));
+        let tqkv = self.lin(&txt_n, &format!("{p}.txt_attn.qkv.weight"));
         let (iq, ik, iv) = self.qkv(
             &iqkv,
             &format!("{p}.img_attn.norm.query_norm.scale"),
@@ -626,8 +655,8 @@ impl Flux2 {
         let li = img.dim(1);
         let txt_attn = attn.narrow(1, 0, lt).contiguous();
         let img_attn = attn.narrow(1, lt, li).contiguous();
-        let img_attn = ops::linear(&img_attn, self.params.get(&format!("{p}.img_attn.proj.weight")), None);
-        let txt_attn = ops::linear(&txt_attn, self.params.get(&format!("{p}.txt_attn.proj.weight")), None);
+        let img_attn = self.lin(&img_attn, &format!("{p}.img_attn.proj.weight"));
+        let txt_attn = self.lin(&txt_attn, &format!("{p}.txt_attn.proj.weight"));
         let img = ops::add(&img, &ops::mul(&img_attn, &im[2]));
         let img_n = self.modulate(&img, &im[3], &im[4]);
         let img_ff = self.swiglu_mlp(&img_n, &format!("{p}.img_mlp.0.weight"), &format!("{p}.img_mlp.2.weight"));
@@ -643,7 +672,7 @@ impl Flux2 {
         let p = format!("single_blocks.{i}");
         let sm = &step.single_mod;
         let xn = self.modulate(&x, &sm[0], &sm[1]);
-        let h = ops::linear(&xn, self.params.get(&format!("{p}.linear1.weight")), None);
+        let h = self.lin(&xn, &format!("{p}.linear1.weight"));
         let inner = self.config.inner_dim();
         let mlp = self.config.mlp_hidden();
         let qkv = h.narrow(2, 0, 3 * inner).contiguous();
@@ -653,7 +682,7 @@ impl Flux2 {
         let gate = h.narrow(2, 3 * inner + mlp, mlp).contiguous();
         let m = ops::mul(&ops::silu(&a), &gate);
         let cat = ops::concat(&[&attn, &m], 2);
-        let out = ops::linear(&cat, self.params.get(&format!("{p}.linear2.weight")), None);
+        let out = self.lin(&cat, &format!("{p}.linear2.weight"));
         self.clamp_f16(ops::add(&x, &ops::mul(&out, &sm[2])))
     }
 
@@ -665,8 +694,8 @@ impl Flux2 {
     ///
     /// Returns the prediction for all `N` image tokens: `[B, N, out_channels]`.
     pub fn forward(&self, img: &Var, txt: &Var, step: &Flux2Step, rope: &Var) -> Var {
-        let mut img = ops::linear(img, self.params.get("img_in.weight"), None);
-        let mut txt = ops::linear(txt, self.params.get("txt_in.weight"), None);
+        let mut img = self.lin(img, "img_in.weight");
+        let mut txt = self.lin(txt, "txt_in.weight");
         for i in 0..self.config.num_layers {
             let (a, b) = self.double_block(i, img, txt, step, rope);
             img = a;
@@ -681,13 +710,13 @@ impl Flux2 {
             x = self.single_block(i, x, step, rope);
         }
         let x = x.narrow(1, lt, li).contiguous();
-        let emb = ops::linear(&ops::silu(&step.temb), self.params.get("final_layer.adaLN_modulation.1.weight"), None);
+        let emb = self.lin(&ops::silu(&step.temb), "final_layer.adaLN_modulation.1.weight");
         let dim = self.config.inner_dim();
         let b = emb.dim(0);
         let emb = emb.reshape(&[b, 1, 2 * dim]);
         let shift = emb.narrow(2, 0, dim).contiguous();
         let scale = ops::add_scalar(&emb.narrow(2, dim, dim).contiguous(), 1.0);
         let x = self.modulate(&x, &shift, &scale);
-        ops::linear(&x, self.params.get("final_layer.linear.weight"), None)
+        self.lin(&x, "final_layer.linear.weight")
     }
 }

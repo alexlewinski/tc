@@ -178,3 +178,19 @@ fn index_select_and_dtypes() {
     let b = fx.var(&g, "linear.b").to_dtype(DataType::F16);
     check(&fx, &ops::linear(&x, &w, Some(&b)), "linear.out", 2e-2);
 }
+
+#[test]
+fn palettize_roundtrip() {
+    let n = 40000;
+    let data: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013).sin() * 0.5).collect();
+    let host = HostTensor::from_f32(&data, &[200, 200]).to_dtype(DataType::F16);
+    let q = nnc::quant::palettize(&host, 8, nnc::quant::DEFAULT_BLOCK);
+    assert_eq!(q.len(), 3 * 256 * 2 + n);
+    let back = nnc::quant::depalettize(&q, DataType::F16, &[200, 200], 8, nnc::quant::DEFAULT_BLOCK).to_f32_vec();
+    let max = data.iter().zip(back.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    assert!(max < 0.01, "palettize error {max}");
+    let g = Graph::new();
+    let v = g.from_palettized(&q, DataType::F16, &[200, 200], 8, nnc::quant::DEFAULT_BLOCK, Device::Cpu);
+    assert!(v.is_quantized());
+    assert_eq!(v.shape(), vec![200, 200]);
+}

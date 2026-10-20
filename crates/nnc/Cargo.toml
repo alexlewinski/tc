@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 nnc-sys = { path = "../nnc-sys" }
 half = { version = "2", features = ["bytemuck"] }
+rayon = "1"
 bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 thiserror = "2"
 

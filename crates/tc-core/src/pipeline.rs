@@ -88,12 +88,15 @@ pub struct EngineOptions {
     pub keep_text_encoder: bool,
     /// Number of prompt embeddings to cache.
     pub prompt_cache_size: usize,
+    /// Store transformer and text encoder linear weights 8-bit palettized (about half the
+    /// memory; LoRAs then run as separate low-rank branches instead of being merged).
+    pub quantize: bool,
 }
 
 impl Default for EngineOptions {
     fn default() -> Self {
         let device = nnc::default_device();
-        EngineOptions { device, precision: Precision::default_for(device), keep_text_encoder: false, prompt_cache_size: 8 }
+        EngineOptions { device, precision: Precision::default_for(device), keep_text_encoder: false, prompt_cache_size: 8, quantize: false }
     }
 }
 
@@ -266,7 +269,7 @@ impl Flux2Engine {
         self.graph.garbage_collect();
         let t0 = Instant::now();
         let (source, config) = open_source(&files.transformer)?;
-        let model = Flux2::load(&self.graph, &source, config, self.options.device, self.options.precision.transformer)?;
+        let model = Flux2::load(&self.graph, &source, config, self.options.device, self.options.precision.transformer, self.options.quantize)?;
         info!("loaded transformer {} in {:.1}s", files.transformer.display(), t0.elapsed().as_secs_f32());
         self.transformer = Some(LoadedTransformer { files: files.transformer, source, model, applied: vec![], touched: vec![] });
         Ok(())
@@ -282,12 +285,21 @@ impl Flux2Engine {
             t.model.reload_param(&self.graph, &t.source, &name)?;
         }
         t.applied.clear();
+        t.model.adapters.clear();
         let resolver = Flux2LoraResolver { config: t.model.config.clone() };
         let mut touched = std::collections::BTreeSet::new();
         for spec in loras {
             let file = LoraFile::open(&spec.path)?;
-            let report = merge(&mut t.model.params, &resolver, &file, spec.weight)
-                .with_context(|| format!("merging LoRA {}", spec.path.display()))?;
+            let report = if t.model.quantized {
+                let (list, report) = crate::lora::adapters(&t.model.params, &resolver, &file, spec.weight)
+                    .with_context(|| format!("loading LoRA {}", spec.path.display()))?;
+                for (param, a) in list {
+                    t.model.adapters.entry(param).or_default().push(a);
+                }
+                report
+            } else {
+                merge(&mut t.model.params, &resolver, &file, spec.weight).with_context(|| format!("merging LoRA {}", spec.path.display()))?
+            };
             info!("LoRA {} (weight {}): {} updates applied", spec.path.display(), spec.weight, report.applied);
             if !report.unmatched.is_empty() {
                 warn!(
@@ -300,7 +312,9 @@ impl Flux2Engine {
             if report.applied == 0 {
                 bail!("LoRA {} does not match this model", spec.path.display());
             }
-            touched.extend(report.touched);
+            if !t.model.quantized {
+                touched.extend(report.touched);
+            }
         }
         t.touched = touched.into_iter().collect();
         t.applied = loras.to_vec();
@@ -333,6 +347,7 @@ impl Flux2Engine {
                 layers,
                 self.options.device,
                 self.options.precision.text_encoder,
+                self.options.quantize,
             )?);
             info!("loaded text encoder in {:.1}s", t0.elapsed().as_secs_f32());
         }

@@ -12,6 +12,7 @@ fn engine(distilled: bool) -> Flux2Engine {
         precision: Precision::default_for(Device::Cpu),
         keep_text_encoder: false,
         prompt_cache_size: 0,
+        quantize: false,
     });
     e.set_model(Flux2Files {
         transformer: dir.join("transformer"),

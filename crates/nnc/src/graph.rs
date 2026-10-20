@@ -92,6 +92,10 @@ impl Graph {
         self.wrap(unsafe { sys::ccv_nnc_tensor_variable_new_impl(self.inner.raw, p) })
     }
 
+    pub(crate) fn new_with_params(&self, p: sys::ccv_nnc_tensor_param_t) -> Var {
+        self.wrap(unsafe { sys::ccv_nnc_tensor_variable_new_impl(self.inner.raw, p) })
+    }
+
     /// An uninitialized tensor variable with the given layout (memory is allocated lazily).
     pub fn empty(&self, device: Device, dtype: DataType, shape: &[usize]) -> Var {
         self.empty_with_format(device, Format::Nhwc, dtype, shape)
@@ -253,7 +257,17 @@ impl Var {
     }
 
     pub fn dtype(&self) -> DataType {
-        DataType::from_raw(self.raw_params().datatype).expect("unknown data type")
+        let raw = self.raw_params().datatype;
+        if (raw as u32) & 0xFF000 == sys::CCV_QX {
+            // Palettized: report the element type of the palette.
+            return DataType::from_raw((raw & 0xff) << 12).expect("unknown data type");
+        }
+        DataType::from_raw(raw).expect("unknown data type")
+    }
+
+    /// Whether this tensor holds palettized (quantized) data.
+    pub fn is_quantized(&self) -> bool {
+        (self.raw_params().datatype as u32) & 0xFF000 == sys::CCV_QX
     }
 
     pub fn device(&self) -> Device {
@@ -388,7 +402,26 @@ impl Var {
         let src = self.contiguous();
         let out = self.graph().empty_with_format(device, self.format(), self.dtype(), &self.shape());
         crate::ops::data_transfer(&src, &out);
+        if src.device() == Device::Cpu && !self.graph().stream().is_null() {
+            // The copy may still be in flight on the GPU stream: keep the host buffer alive for
+            // as long as the destination exists.
+            return out.with_keepalive(src);
+        }
         out
+    }
+
+    pub(crate) fn keep_alive(self, keep: Var) -> Var {
+        self.with_keepalive(keep)
+    }
+
+    fn with_keepalive(self, keep: Var) -> Var {
+        match Rc::try_unwrap(self.inner) {
+            Ok(mut inner) => {
+                inner._parent = Some(keep);
+                Var { inner: Rc::new(inner) }
+            }
+            Err(inner) => Var { inner },
+        }
     }
 
     /// Convert element type.

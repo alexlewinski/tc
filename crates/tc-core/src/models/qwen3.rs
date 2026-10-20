@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use nnc::{ops, DataType, Device, Graph, HostTensor, Var};
 use serde::Deserialize;
 
-use crate::weights::{upload, Params, SafeTensorsFiles};
+use crate::weights::{Params, SafeTensorsFiles};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Qwen3Config {
@@ -75,10 +75,10 @@ fn interleave_rows(t: &HostTensor, head_dim: usize) -> HostTensor {
 impl Qwen3 {
     /// Load from a `text_encoder` directory (config.json + safetensors). Only the first
     /// `num_layers` decoder layers are loaded.
-    pub fn load(graph: &Graph, dir: &Path, num_layers: usize, device: Device, dtype: DataType) -> Result<Qwen3> {
+    pub fn load(graph: &Graph, dir: &Path, num_layers: usize, device: Device, dtype: DataType, quantize: bool) -> Result<Qwen3> {
         let config: Qwen3Config = serde_json::from_slice(&std::fs::read(dir.join("config.json")).context("text encoder config.json")?)?;
         let files = SafeTensorsFiles::open_dir(dir)?;
-        Qwen3::load_from(graph, &files, config, num_layers, device, dtype)
+        Qwen3::load_from(graph, &files, config, num_layers, device, dtype, quantize)
     }
 
     pub fn load_from(
@@ -88,13 +88,15 @@ impl Qwen3 {
         num_layers: usize,
         device: Device,
         dtype: DataType,
+        quantize: bool,
     ) -> Result<Qwen3> {
         let prefix = if files.contains("model.embed_tokens.weight") { "model." } else { "" };
         let hd = config.head_dim();
         let mut params = Params::new();
         let mut load = |name: &str, f: &dyn Fn(HostTensor) -> HostTensor| -> Result<()> {
             let host = files.read(&format!("{prefix}{name}"), dtype).with_context(|| format!("loading {name}"))?;
-            params.insert(name.to_string(), upload(graph, &f(host), device, dtype));
+            let q = quantize && name.starts_with("layers.");
+            params.insert(name.to_string(), crate::models::flux2::upload_weight(graph, &f(host), device, dtype, q));
             Ok(())
         };
         let id = |t: HostTensor| t;

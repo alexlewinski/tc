@@ -33,7 +33,7 @@ async fn start(secret: Option<&str>, upload_dir: PathBuf) -> u16 {
     let device = nnc::Device::Cpu;
     let worker = Arc::new(Worker::spawn(
         store,
-        EngineOptions { device, precision: Precision::default_for(device), keep_text_encoder: true, prompt_cache_size: 4 },
+        EngineOptions { device, precision: Precision::default_for(device), keep_text_encoder: true, prompt_cache_size: 4, quantize: false },
     ));
     let options = ServiceOptions { shared_secret: secret.map(|s| s.to_string()), response_compression: true, model_browser: true };
     let addr = format!("127.0.0.1:{port}").parse().unwrap();

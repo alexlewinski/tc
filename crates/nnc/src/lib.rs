@@ -11,6 +11,7 @@
 mod graph;
 mod host;
 pub mod ops;
+pub mod quant;
 mod types;
 
 pub use graph::{Graph, Var};
