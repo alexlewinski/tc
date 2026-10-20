@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14   # Apple Silicon; builds the Metal (MPS) backend
+          - os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test (CPU)
+        run: cargo test --workspace
+      - name: Metal op tests
+        if: runner.os == 'macOS'
+        continue-on-error: true   # hosted runners may not expose a usable Metal device
+        run: |
+          cargo run -q -p nnc --example devices
+          NNC_TEST_DEVICE=gpu cargo test -p nnc --test ops -- --test-threads=1
+      - name: Release build
+        run: cargo build --release -p draw-things-cli -p grpc-server-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.os }}
+          path: |
+            target/release/draw-things-cli
+            target/release/gRPCServerCLI
