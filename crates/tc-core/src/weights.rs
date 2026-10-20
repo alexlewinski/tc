@@ -326,3 +326,11 @@ pub fn conv_weight_to_nhwc(w: &[f32], shape: &[usize]) -> (Vec<f32>, Vec<usize>)
     });
     (out, vec![o, kh, kw, i])
 }
+
+/// Whether `path` is a SQLite database (the Draw Things `.ckpt` weight format), which is not
+/// supported; used to give a clear error instead of a safetensors parse failure.
+pub fn is_sqlite_checkpoint(path: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 16];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && &magic == b"SQLite format 3\0"
+}

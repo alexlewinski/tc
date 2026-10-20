@@ -54,6 +54,9 @@ The models directory defaults to `$DRAWTHINGS_MODELS_DIR`, then `<binary dir>/Mo
 `~/Documents/Models`; override with `--models-dir`. A model is a Hugging Face snapshot in
 diffusers layout (`model_index.json`, `transformer/`, `text_encoder/`, `tokenizer/`, `vae/`,
 `scheduler/`), stored as `<models-dir>/FLUX.2-klein-9B/` or found in the Hugging Face cache.
+Pointing `--models-dir` at the Draw Things models folder works (snapshots and files coexist),
+but Draw Things' own converted weights (`*.ckpt`, a SQLite format) are not read: models must be
+the diffusers release, and LoRAs the original `.safetensors` files.
 
 ## Serving over gRPC
 

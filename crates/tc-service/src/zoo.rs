@@ -199,6 +199,13 @@ impl ModelStore {
             .snapshot_dir(&repo)
             .or_else(|| self.dirs.iter().map(|d| d.join(reference)).find(|p| p.join("transformer").is_dir()))
             .with_context(|| {
+                if self.dirs.iter().any(|d| tc_core::weights::is_sqlite_checkpoint(&d.join(reference))) {
+                    return format!(
+                        "{reference:?} in {:?} is a Draw Things checkpoint (SQLite .ckpt), which is not supported; \
+                         download the diffusers release next to it with `draw-things-cli models ensure --model {reference}`",
+                        self.dirs
+                    );
+                }
                 format!(
                     "model {reference:?} not found in {:?}; download it with `draw-things-cli models ensure --model {reference}`",
                     self.dirs

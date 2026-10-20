@@ -113,6 +113,12 @@ fn split_key(key: &str) -> Option<(String, Part)> {
 
 impl LoraFile {
     pub fn open(path: &Path) -> Result<LoraFile> {
+        if crate::weights::is_sqlite_checkpoint(path) {
+            anyhow::bail!(
+                "{} is a Draw Things checkpoint (SQLite .ckpt), which is not supported; use the LoRA's original .safetensors file",
+                path.display()
+            );
+        }
         let files = SafeTensorsFiles::open(&[path]).with_context(|| format!("opening LoRA {}", path.display()))?;
         LoraFile::from_files(&files)
     }
