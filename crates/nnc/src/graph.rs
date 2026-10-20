@@ -83,7 +83,7 @@ impl Graph {
     }
 
     fn wrap(&self, raw: sys::ccv_nnc_tensor_variable_t) -> Var {
-        Var { inner: Rc::new(VarInner { graph: self.clone(), raw }) }
+        Var { inner: Rc::new(VarInner { graph: self.clone(), raw, _parent: None }) }
     }
 
     /// An uninitialized variable whose shape will be inferred by the op that writes it.
@@ -148,6 +148,13 @@ impl Graph {
         inputs: &[Option<&Var>],
         outputs: &[Option<&Var>],
     ) -> Result<()> {
+        if std::env::var_os("NNC_DEBUG_EXEC").is_some() {
+            let name = unsafe { std::ffi::CStr::from_ptr(sys::ccv_nnc_cmd_name(cmd.cmd)) };
+            eprintln!("exec {name:?}");
+            for v in inputs.iter().flatten() {
+                eprintln!("  in {:?} strides {:?}", v.shape(), v.strides());
+            }
+        }
         let ins: Vec<sys::ccv_nnc_tensor_variable_t> =
             inputs.iter().map(|v| v.map(|v| v.raw()).unwrap_or(std::ptr::null_mut())).collect();
         let mut outs: Vec<sys::ccv_nnc_tensor_variable_t> =
@@ -193,6 +200,9 @@ impl Graph {
 pub(crate) struct VarInner {
     pub(crate) graph: Graph,
     pub(crate) raw: sys::ccv_nnc_tensor_variable_t,
+    /// Aliases keep the variable they view alive: nnc refers to the root by slot index and
+    /// reuses freed slots.
+    _parent: Option<Var>,
 }
 
 impl Drop for VarInner {
@@ -310,7 +320,7 @@ impl Var {
         let raw = unsafe {
             sys::ccv_nnc_tensor_variable_alias_new(self.graph().inner.raw, self.raw(), ofs.as_ptr(), st.as_ptr(), p)
         };
-        self.graph().wrap(raw)
+        Var { inner: Rc::new(VarInner { graph: self.graph().clone(), raw, _parent: Some(self.clone()) }) }
     }
 
     /// Reinterpret with a new shape (same number of elements). Copies if the variable is a
