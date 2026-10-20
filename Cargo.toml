@@ -6,6 +6,10 @@ members = [
   "crates/tc-core",
   "crates/tc-config",
   "crates/tc-wire",
+  "crates/tc-service",
+  "crates/tc-grpc",
+  "apps/grpc-server-cli",
+  "apps/draw-things-cli",
 ]
 
 [workspace.package]

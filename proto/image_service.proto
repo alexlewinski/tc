@@ -1,0 +1,191 @@
+// Image generation service.
+//
+// Wire-compatible with the Draw Things gRPC image generation protocol (same service, message,
+// field names and numbers). See docs/INTERFACE.md for the semantics implemented here.
+syntax = "proto3";
+
+service ImageGenerationService {
+  // Run a generation; streams progress signposts, then the result image(s).
+  rpc GenerateImage(ImageGenerationRequest) returns (stream ImageGenerationResponse);
+  // Report which files are available on the server (optionally with SHA-256).
+  rpc FilesExist(FileListRequest) returns (FileExistenceResponse);
+  // Upload a file (model / LoRA) into the server's models directory.
+  rpc UploadFile(stream FileUploadRequest) returns (stream UploadResponse);
+  // Health check / handshake.
+  rpc Echo(EchoRequest) returns (EchoReply);
+  rpc Pubkey(PubkeyRequest) returns (PubkeyResponse);
+  rpc Hours(HoursRequest) returns (HoursResponse);
+}
+
+message EchoRequest {
+  string name = 1;
+  optional string sharedSecret = 2;
+}
+
+message ComputeUnitThreshold {
+  double community = 1;
+  double plus = 2;
+  int64 expireAt = 3;
+}
+
+message EchoReply {
+  string message = 1;
+  repeated string files = 2;
+  optional MetadataOverride override = 3;
+  bool sharedSecretMissing = 4;
+  optional ComputeUnitThreshold thresholds = 5;
+  uint64 serverIdentifier = 6;
+}
+
+message FileListRequest {
+  repeated string files = 1;
+  repeated string filesWithHash = 2;
+  optional string sharedSecret = 3;
+}
+
+message FileExistenceResponse {
+  repeated string files = 1;
+  repeated bool existences = 2;
+  repeated bytes hashes = 3;
+}
+
+// JSON-encoded metadata blobs describing models, LoRAs, etc.
+message MetadataOverride {
+  bytes models = 1;
+  bytes loras = 2;
+  bytes controlNets = 3;
+  bytes textualInversions = 4;
+  bytes upscalers = 5;
+}
+
+enum DeviceType {
+  PHONE = 0;
+  TABLET = 1;
+  LAPTOP = 2;
+}
+
+message ImageGenerationRequest {
+  // Init / canvas image: tensor bytes, or a 32-byte SHA-256 referencing `contents`.
+  optional bytes image = 1;
+  int32 scaleFactor = 2;
+  optional bytes mask = 3;
+  repeated HintProto hints = 4;
+  string prompt = 5;
+  string negativePrompt = 6;
+  // GenerationConfiguration FlatBuffer.
+  bytes configuration = 7;
+  MetadataOverride override = 8;
+  repeated string keywords = 9;
+  string user = 10;
+  DeviceType device = 11;
+  // Content-addressed blobs (keyed by SHA-256) referenced by image / mask / hints.
+  repeated bytes contents = 12;
+  optional string sharedSecret = 13;
+  // The client accepts responses split into chunks.
+  bool chunked = 14;
+}
+
+message HintProto {
+  string hintType = 1;
+  repeated TensorAndWeight tensors = 2;
+}
+
+message TensorAndWeight {
+  bytes tensor = 1;
+  float weight = 2;
+}
+
+message ImageGenerationSignpostProto {
+  message TextEncoded {}
+  message ImageEncoded {}
+  message Sampling {
+    int32 step = 1;
+  }
+  message ImageDecoded {}
+  message SecondPassImageEncoded {}
+  message SecondPassSampling {
+    int32 step = 1;
+  }
+  message SecondPassImageDecoded {}
+  message FaceRestored {}
+  message ImageUpscaled {}
+  oneof signpost {
+    TextEncoded textEncoded = 1;
+    ImageEncoded imageEncoded = 2;
+    Sampling sampling = 3;
+    ImageDecoded imageDecoded = 4;
+    SecondPassImageEncoded secondPassImageEncoded = 5;
+    SecondPassSampling secondPassSampling = 6;
+    SecondPassImageDecoded secondPassImageDecoded = 7;
+    FaceRestored faceRestored = 8;
+    ImageUpscaled imageUpscaled = 9;
+  }
+}
+
+enum ChunkState {
+  LAST_CHUNK = 0;
+  MORE_CHUNKS = 1;
+}
+
+message RemoteDownloadResponse {
+  int64 bytesReceived = 1;
+  int64 bytesExpected = 2;
+  int32 item = 3;
+  int32 itemsExpected = 4;
+  string tag = 5;
+}
+
+message ImageGenerationResponse {
+  repeated bytes generatedImages = 1;
+  optional ImageGenerationSignpostProto currentSignpost = 2;
+  repeated ImageGenerationSignpostProto signposts = 3;
+  optional bytes previewImage = 4;
+  optional int32 scaleFactor = 5;
+  repeated string tags = 6;
+  optional int64 downloadSize = 7;
+  ChunkState chunkState = 8;
+  optional RemoteDownloadResponse remoteDownload = 9;
+  repeated bytes generatedAudio = 10;
+}
+
+message FileChunk {
+  bytes content = 1;
+  string filename = 2;
+  int64 offset = 3;
+}
+
+message InitUploadRequest {
+  string filename = 1;
+  bytes sha256 = 2;
+  int64 totalSize = 3;
+}
+
+message UploadResponse {
+  bool chunkUploadSuccess = 1;
+  int64 receivedOffset = 2;
+  string message = 3;
+  string filename = 4;
+}
+
+message FileUploadRequest {
+  oneof request {
+    InitUploadRequest initRequest = 1;
+    FileChunk chunk = 2;
+  }
+  optional string sharedSecret = 3;
+}
+
+message PubkeyRequest {
+  string name = 1;
+}
+
+message PubkeyResponse {
+  string message = 1;
+  string pubkey = 2;
+}
+
+message HoursRequest {}
+
+message HoursResponse {
+  ComputeUnitThreshold thresholds = 1;
+}

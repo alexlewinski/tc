@@ -1,0 +1,30 @@
+[package]
+name = "draw-things-cli"
+description = "draw-things-cli: local FLUX.2 image generation from the command line."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "draw-things-cli"
+path = "src/main.rs"
+
+[dependencies]
+tc-grpc = { path = "../../crates/tc-grpc" }
+tc-service = { path = "../../crates/tc-service" }
+tc-core = { path = "../../crates/tc-core" }
+tc-config = { path = "../../crates/tc-config" }
+tc-wire = { path = "../../crates/tc-wire" }
+nnc = { path = "../../crates/nnc" }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+base64 = "0.22"
+
+[dev-dependencies]
+serde_json = "1"

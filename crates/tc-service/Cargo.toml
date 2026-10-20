@@ -1,0 +1,20 @@
+[package]
+name = "tc-service"
+description = "Model registry, request translation and the generation worker shared by the CLI and gRPC server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tc-core = { path = "../tc-core" }
+tc-config = { path = "../tc-config" }
+tc-wire = { path = "../tc-wire" }
+nnc = { path = "../nnc" }
+anyhow = "1"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+sha2 = "0.10"
+ureq = { version = "2", features = ["json"] }
+dirs = "5"

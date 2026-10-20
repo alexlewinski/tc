@@ -104,6 +104,16 @@ pub struct LoraSpec {
     pub weight: f32,
 }
 
+/// Flow-matching sampler variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Sampler {
+    /// Deterministic Euler (the reference FLUX.2 sampler).
+    #[default]
+    Euler,
+    /// Re-noises the predicted clean latent with fresh noise at every step.
+    EulerAncestral,
+}
+
 /// One generation request.
 #[derive(Clone, Debug)]
 pub struct GenerateParams {
@@ -122,6 +132,7 @@ pub struct GenerateParams {
     pub loras: Vec<LoraSpec>,
     /// `None` = FLUX.2's resolution dependent shift; `Some(k)` = constant shift `k`.
     pub shift: Option<f32>,
+    pub sampler: Sampler,
     pub num_images: usize,
     /// Maximum text tokens.
     pub max_sequence_length: usize,
@@ -144,6 +155,7 @@ impl Default for GenerateParams {
             reference_images: vec![],
             loras: vec![],
             shift: None,
+            sampler: Sampler::Euler,
             num_images: 1,
             max_sequence_length: 512,
             prompt_embeddings: None,
@@ -457,14 +469,18 @@ impl Flux2Engine {
         for n in 0..p.num_images.max(1) {
             let seed = p.seed.wrapping_add(n as u64);
             // Noise in NCHW order (matching reference pipelines for a given seed) -> tokens.
-            let noise = TorchCpuRng::new(seed).randn(channels * n_tokens);
-            let mut tokens = vec![0f32; noise.len()];
-            for c in 0..channels {
-                for i in 0..n_tokens {
-                    tokens[i * channels + c] = noise[c * n_tokens + i];
+            let mut rng = TorchCpuRng::new(seed);
+            let draw_noise = |rng: &mut TorchCpuRng| {
+                let noise = rng.randn(channels * n_tokens);
+                let mut tokens = vec![0f32; noise.len()];
+                for c in 0..channels {
+                    for i in 0..n_tokens {
+                        tokens[i * channels + c] = noise[c * n_tokens + i];
+                    }
                 }
-            }
-            let noise = graph.from_f32(&tokens, &[1, n_tokens, channels], device, DataType::F32);
+                graph.from_f32(&tokens, &[1, n_tokens, channels], device, DataType::F32)
+            };
+            let noise = draw_noise(&mut rng);
             // Keep the running latent in f32 for accuracy across steps.
             let mut x = match &init {
                 Some(init) => {
@@ -498,7 +514,13 @@ impl Flux2Engine {
                     v = ops::add_scaled(&vu, &d, 1.0, p.guidance_scale);
                 }
                 let v = v.to_dtype(DataType::F32);
-                x = ops::add_scaled(&x, &v, 1.0, (s_next - s) as f32);
+                if p.sampler == Sampler::EulerAncestral && s_next > 0.0 {
+                    let x0 = ops::add_scaled(&x, &v, 1.0, -(s as f32));
+                    let fresh = draw_noise(&mut rng);
+                    x = ops::add_scaled(&x0, &fresh, 1.0 - s_next as f32, s_next as f32);
+                } else {
+                    x = ops::add_scaled(&x, &v, 1.0, (s_next - s) as f32);
+                }
                 if !progress(Progress::Sampling { step: i + 1, total: p.steps }) {
                     cancel.cancel();
                 }

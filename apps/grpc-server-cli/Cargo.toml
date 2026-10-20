@@ -1,0 +1,23 @@
+[package]
+name = "grpc-server-cli"
+description = "gRPCServerCLI: serve FLUX.2 image generation over the Draw Things compatible gRPC protocol."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gRPCServerCLI"
+path = "src/main.rs"
+
+[dependencies]
+tc-grpc = { path = "../../crates/tc-grpc" }
+tc-service = { path = "../../crates/tc-service" }
+tc-core = { path = "../../crates/tc-core" }
+nnc = { path = "../../crates/nnc" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+mdns-sd = "0.11"
+hostname = "0.4"
