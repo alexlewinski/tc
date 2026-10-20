@@ -120,7 +120,7 @@ struct Args {
     #[arg(long)]
     echo_on_queue: bool,
 
-    /// Transformer precision: f16, bf16 or f32 (default: f16 on GPU, f32 on CPU).
+    /// Transformer precision: f16, bf16 or f32 (default: bf16 on GPU, f32 on CPU).
     #[arg(long)]
     precision: Option<String>,
     /// Text encoder precision: f16, bf16 or f32 (default: bf16 on GPU, f32 on CPU).

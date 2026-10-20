@@ -67,7 +67,7 @@ format. `crates/tc-grpc/src/client.rs` is a compact reference client.
 
 | Component | GPU default | CPU |
 |-----------|-------------|-----|
-| FLUX.2 transformer | f16 (`--precision bf16` available) | f32 |
+| FLUX.2 transformer | bf16 (`--precision f16` is faster on M1/M2, may overflow) | f32 |
 | Qwen3 text encoder | bf16 (`--text-encoder-precision`) | f32 |
 | VAE | f16 | f32 |
 

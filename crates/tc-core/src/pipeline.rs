@@ -72,7 +72,9 @@ pub struct Precision {
 impl Precision {
     pub fn default_for(device: Device) -> Precision {
         if device.is_gpu() {
-            Precision { transformer: DataType::F16, text_encoder: DataType::BF16, vae: DataType::F16 }
+            // FLUX.2 and Qwen3 are trained in bf16; fp16 activations can overflow. The VAE is
+            // fine in f16 (and nnc's group norm has no bf16 Metal kernel).
+            Precision { transformer: DataType::BF16, text_encoder: DataType::BF16, vae: DataType::F16 }
         } else {
             // nnc's CPU GEMM kernels are FP32 only.
             Precision { transformer: DataType::F32, text_encoder: DataType::F32, vae: DataType::F32 }
