@@ -136,7 +136,7 @@ device). To run them on your own Mac:
 
 ```sh
 cargo run -q -p nnc --example devices    # should list one GPU
-NNC_TEST_DEVICE=gpu cargo test -p nnc -p tc-core -p draw-things-cli -- --test-threads=1
+NNC_TEST_DEVICE=gpu cargo test -p nnc -p tc-core -p tc-service -p draw-things-cli -- --test-threads=1
 ```
 
 This compares each op and model on Metal with the PyTorch references, and runs the reference

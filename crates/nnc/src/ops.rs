@@ -2,7 +2,7 @@
 
 use crate::graph::Var;
 use crate::sys;
-use crate::types::MAX_DIM;
+use crate::types::{DataType, MAX_DIM};
 
 fn base_params() -> sys::ccv_nnc_cmd_param_t {
     let mut p = sys::ccv_nnc_cmd_param_t::default();
@@ -288,10 +288,30 @@ pub fn scaled_dot_product_attention(
     is_causal: bool,
     mask: Option<&Var>,
 ) -> Var {
+    let g = q.graph().clone();
+    // nnc's Metal kernel gets `is_causal` wrong (PyTorch semantics: query i attends to keys
+    // 0..=i), so causality is always applied as an explicit additive mask (same path on CPU,
+    // which the CPU tests cover).
+    let causal_mask;
+    let combined;
+    let (is_causal, mask) = if is_causal {
+        let (tq, tk) = (q.dim(1), k.dim(1));
+        let neg = if q.dtype() == DataType::F16 { -65504.0 } else { -1e9 };
+        let m: Vec<f32> = (0..tq * tk).map(|i| if i % tk > i / tk { neg } else { 0.0 }).collect();
+        causal_mask = g.from_f32(&m, &[1, 1, tq, tk], q.device(), q.dtype());
+        match mask {
+            Some(m) => {
+                combined = add(m, &causal_mask);
+                (false, Some(&combined))
+            }
+            None => (false, Some(&causal_mask)),
+        }
+    } else {
+        (is_causal, mask)
+    };
     let mut p = base_params();
     p.__bindgen_anon_1.scaled_dot_product_attention.scale = scale;
     p.__bindgen_anon_1.scaled_dot_product_attention.is_causal = is_causal as i32;
-    let g = q.graph().clone();
     let inputs: Vec<Option<&Var>> = match mask {
         Some(m) => vec![Some(q), Some(k), Some(v), Some(m)],
         None => vec![Some(q), Some(k), Some(v)],
