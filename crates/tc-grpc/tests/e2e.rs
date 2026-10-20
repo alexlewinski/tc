@@ -26,14 +26,18 @@ fn expected(file: &str) -> Vec<f32> {
 }
 
 async fn start(secret: Option<&str>, upload_dir: PathBuf) -> u16 {
+    start_with(secret, vec![upload_dir, fixtures()]).await
+}
+
+async fn start_with(secret: Option<&str>, dirs: Vec<PathBuf>) -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    let store = ModelStore::new(vec![upload_dir, fixtures()]);
+    let store = ModelStore::new(dirs);
     let device = nnc::Device::Cpu;
     let worker = Arc::new(Worker::spawn(
         store,
-        EngineOptions { device, precision: Precision::default_for(device), keep_text_encoder: true, prompt_cache_size: 4, quantize: false },
+        EngineOptions { device, precision: Precision::default_for(device), keep_text_encoder: true, prompt_cache_size: 4, quantize: false, keep_palettized: true },
     ));
     let options = ServiceOptions { shared_secret: secret.map(|s| s.to_string()), response_compression: true, model_browser: true };
     let addr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -179,4 +183,25 @@ async fn grpc_generate_echo_files_and_upload() {
     let _ = ok;
     assert!(!upload_dir.parent().unwrap().join("evil").exists());
     let _ = std::fs::remove_dir_all(upload_dir);
+}
+
+/// The Draw Things file layout (transformer / text encoder / VAE / LoRA as `.ckpt`) served over
+/// gRPC: model and LoRAs are named by their Draw Things file names.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_generate_with_draw_things_checkpoints() {
+    let dir = std::env::temp_dir().join(format!("tc-grpc-dt-models-{}", std::process::id()));
+    tc_service::testing::write_tiny_draw_things_models(&fixtures(), &dir).unwrap();
+    let port = start_with(None, vec![dir.clone()]).await;
+    let mut client = RemoteClient::connect("127.0.0.1", port, false, None).await.unwrap();
+    let mut c = config();
+    c.model = Some("flux_2_klein_tiny_f32.ckpt".into());
+    c.loras[1].file = Some("lora_b_dt.ckpt".into());
+    let result = client.generate(c.to_flatbuffer(), "a red cube on a table", "", None, vec![], |_| {}).await.unwrap();
+    let t = &result.images[0];
+    assert_eq!(t.shape, vec![1, 64, 128, 3]);
+    let got: Vec<f32> = t.to_f32().iter().map(|v| (v / 2.0 + 0.5).clamp(0.0, 1.0)).collect();
+    let exp = expected("expected.safetensors");
+    let max = got.iter().zip(exp.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    assert!(max < 2e-3, "max error {max}");
+    let _ = std::fs::remove_dir_all(dir);
 }

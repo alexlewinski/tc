@@ -94,3 +94,29 @@ fn quantized_weights_stay_close() {
     assert!(rmse < 5e-4, "rmse {rmse}");
     assert!(back.iter().zip(&w).any(|(a, b)| a != b), "weights were not quantized");
 }
+
+#[test]
+fn flux2_kv_variant_matches_diffusers() {
+    let dir = "flux2";
+    let g = Graph::new();
+    let (source, config) = open_source(&fixture(dir).join("transformer")).unwrap();
+    let model = Flux2::load(&g, &source, config.clone(), device(), DataType::F32, false).unwrap();
+    let io = SafeTensorsFiles::open(&[fixture(dir).join("flux2_kv_io.safetensors")]).unwrap();
+    let x = load(&g, &io, "x");
+    let r = load(&g, &io, "ref");
+    let ctx = load(&g, &io, "ctx");
+    let mut ids = text_ids(5);
+    ids.extend(image_ids(2, 2, 10.0));
+    ids.extend(image_ids(2, 3, 20.0));
+    ids.extend(image_ids(4, 4, 0.0));
+    let (rope, shape) = rope_table(&ids, &config.axes_dims_rope, config.rope_theta);
+    let rope = g.from_f32(&rope, &shape, device(), DataType::F32);
+    let ref_step = model.prepare_step(&[0.0], None);
+    let input = nnc::ops::concat(&[&r, &x], 1);
+    for (t, key) in [(700.0, "out"), (400.0, "out_cached")] {
+        let step = model.prepare_step(&[t], None);
+        let y = model.forward_kv(&input, &ctx, &step, &ref_step, 10, &rope);
+        assert_eq!(y.shape(), vec![1, 16, 8]);
+        assert_close(&y.to_f32_vec(), &io.read_f32(key).unwrap(), 1e-4, key);
+    }
+}

@@ -2,6 +2,7 @@
 //! translation of a [`GenerationConfiguration`] into a pipeline request, and a worker thread
 //! that owns the inference engine.
 
+pub mod testing;
 pub mod zoo;
 
 use std::path::PathBuf;

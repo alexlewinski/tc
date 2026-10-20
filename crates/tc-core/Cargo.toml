@@ -21,6 +21,9 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rand = "0.8"
 rand_distr = "0.4"
+rusqlite = { version = "0.32", features = ["bundled", "blob"] }
+tc-wire = { path = "../tc-wire" }
+flate2 = "1"
 
 [dev-dependencies]
 approx = "0.5"

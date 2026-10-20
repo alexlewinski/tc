@@ -24,7 +24,7 @@ fn expected(file: &str) -> Vec<f32> {
 
 fn engine(device: Device, precision: Precision) -> (Flux2Engine, ModelStore) {
     let store = ModelStore::new(vec![fixtures()]);
-    let mut engine = Flux2Engine::new(EngineOptions { device, precision, keep_text_encoder: false, prompt_cache_size: 0, quantize: false });
+    let mut engine = Flux2Engine::new(EngineOptions { device, precision, keep_text_encoder: false, prompt_cache_size: 0, quantize: false, keep_palettized: true });
     engine.set_model(store.resolve("tiny-klein").unwrap().files);
     (engine, store)
 }

@@ -10,5 +10,7 @@ pub mod weights;
 pub mod rng;
 pub mod scheduler;
 pub mod tokenizer;
+pub mod ckpt;
+pub mod compare;
 pub mod image_io;
 pub mod pipeline;

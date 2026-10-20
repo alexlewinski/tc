@@ -13,6 +13,7 @@ fn engine(distilled: bool) -> Flux2Engine {
         keep_text_encoder: false,
         prompt_cache_size: 0,
         quantize: false,
+        keep_palettized: true,
     });
     e.set_model(Flux2Files {
         transformer: dir.join("transformer"),
@@ -21,6 +22,7 @@ fn engine(distilled: bool) -> Flux2Engine {
         vae: dir.join("vae"),
         scheduler_config: Some(dir.join("scheduler/scheduler_config.json")),
         is_distilled: distilled,
+        kv: false,
     });
     e
 }

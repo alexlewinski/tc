@@ -328,7 +328,9 @@ fn browse(store: &ModelStore) -> (Vec<String>, String) {
         if let Ok(rd) = std::fs::read_dir(d) {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
-                if name.ends_with(".safetensors") && e.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                // Weight files: safetensors and Draw Things checkpoints (whose data may live in a
+                // `-tensordata` sidecar, not listed itself).
+                if (name.ends_with(".safetensors") || name.ends_with(".ckpt")) && e.metadata().map(|m| m.len() > 0).unwrap_or(false) {
                     files.push(name);
                 }
             }

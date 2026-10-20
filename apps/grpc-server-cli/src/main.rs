@@ -208,7 +208,7 @@ fn run(args: Args) -> Result<()> {
     if let Some(p) = &args.text_encoder_precision {
         precision.text_encoder = parse_dtype(p)?;
     }
-    let options = EngineOptions { device, precision, keep_text_encoder: args.keep_text_encoder && !args.cpu_offload, prompt_cache_size: 16, quantize: args.quantize };
+    let options = EngineOptions { device, precision, keep_text_encoder: args.keep_text_encoder && !args.cpu_offload, prompt_cache_size: 16, quantize: args.quantize, keep_palettized: true };
     info!("device: {device:?}, precision: {precision:?}");
     let store = ModelStore::new(model_dirs(args.models_directory.clone(), args.secondary_models_directory.clone()));
     let worker = Arc::new(Worker::spawn(store, options));

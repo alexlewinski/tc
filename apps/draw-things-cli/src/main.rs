@@ -109,6 +109,34 @@ enum ModelsCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Describe a Draw Things checkpoint (.ckpt): component, encodings, mapping coverage. With
+    /// --lora, check that LoRAs (.ckpt or .safetensors) fully map onto the model.
+    Inspect {
+        #[command(flatten)]
+        dir: ModelsDir,
+        /// Checkpoint file (path or name in the models directory).
+        file: String,
+        /// LoRA files to check against this transformer checkpoint.
+        #[arg(long)]
+        lora: Vec<String>,
+    },
+    /// Compare a Draw Things checkpoint tensor by tensor with the official release of the same
+    /// component (diffusers snapshot directory, component directory or safetensors file). For a
+    /// Draw Things LoRA, compare its weight updates with the original LoRA file.
+    Compare {
+        #[command(flatten)]
+        dir: ModelsDir,
+        /// Draw Things checkpoint (transformer, Qwen3 text encoder or VAE).
+        ckpt: String,
+        /// Reference: e.g. ~/Documents/Models/FLUX.2-klein-9b-kv (or its transformer/ directory).
+        reference: PathBuf,
+        /// Only tensors whose canonical name contains this.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Print every tensor (default: summary per tensor kind).
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -297,12 +325,95 @@ fn models(cmd: ModelsCommand) -> Result<()> {
             Ok(())
         }
         ModelsCommand::Import { dir, artifact, name, base, dry_run, force } => import_model(&store_for(&dir)?, &artifact, name, &base, dry_run, force),
+        ModelsCommand::Inspect { dir, file, lora } => {
+            let store = store_for(&dir)?;
+            let path = store.local_file(&file).with_context(|| format!("{file} not found"))?;
+            print!("{}", zoo::inspect_ckpt(&store, &path, &lora)?);
+            Ok(())
+        }
+        ModelsCommand::Compare { dir, ckpt, reference, filter, all } => {
+            let store = store_for(&dir)?;
+            let path = store.local_file(&ckpt).with_context(|| format!("{ckpt} not found"))?;
+            let lora_file = tc_core::ckpt::CkptFile::open(&path).ok().and_then(|f| tc_core::compare::ckpt_component(&f)) == Some(tc_core::compare::Component::Lora);
+            if lora_file {
+                let reference = store.resolve_lora(&reference.to_string_lossy()).unwrap_or(reference);
+                let transformer = store
+                    .find_ckpts(&store.sibling_dirs(&path), "flux_2_klein")
+                    .into_iter()
+                    .find(|p| tc_core::ckpt::CkptFile::open(p).ok().and_then(|f| tc_core::compare::ckpt_component(&f)) == Some(tc_core::compare::Component::Transformer))
+                    .context("no FLUX.2 transformer checkpoint next to the LoRA to take parameter shapes from")?;
+                let rows = tc_core::compare::compare_lora(&path, &reference, &transformer)?;
+                let mut worst = 0f64;
+                let mut scales = vec![];
+                for (p, rel, scale) in &rows {
+                    if all || !rel.is_finite() {
+                        println!("{p:<50} rel {rel:.5} scale {scale:.4}");
+                    }
+                    if rel.is_finite() {
+                        worst = worst.max(*rel);
+                        scales.push(*scale);
+                    }
+                }
+                scales.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let median = scales.get(scales.len() / 2).copied().unwrap_or(f64::NAN);
+                println!(
+                    "{} parameters compared, worst relative difference of the LoRA updates {worst:.5}, best-fit scale median {median:.4} (min {:.4}, max {:.4})",
+                    scales.len(),
+                    scales.first().copied().unwrap_or(f64::NAN),
+                    scales.last().copied().unwrap_or(f64::NAN)
+                );
+                return Ok(());
+            }
+            let mut kinds: std::collections::BTreeMap<String, (usize, f64, f32)> = Default::default();
+            let rows = tc_core::compare::compare(&path, &reference, filter.as_deref(), &mut |r| {
+                if all {
+                    println!("{:<60} {:>16} rel {:.5} max {:.5}", r.name, format!("{:?}", r.shape), r.rel, r.max_abs);
+                }
+            })?;
+            for r in &rows {
+                let kind = r.name.split('.').filter(|p| p.parse::<usize>().is_err()).collect::<Vec<_>>().join(".");
+                let e = kinds.entry(kind).or_insert((0, 0.0, 0.0));
+                e.0 += 1;
+                e.1 = e.1.max(r.rel);
+                e.2 = e.2.max(r.max_abs);
+            }
+            println!("{:<60} {:>6} {:>12} {:>10}", "tensor kind", "count", "worst rel", "max abs");
+            for (k, (n, rel, mx)) in &kinds {
+                println!("{k:<60} {n:>6} {rel:>12.5} {mx:>10.5}");
+            }
+            let worst = rows.iter().map(|r| r.rel).fold(0.0, f64::max);
+            println!("{} tensors compared, worst relative error {worst:.5}", rows.len());
+            Ok(())
+        }
     }
 }
 
 fn ensure_model(store: &ModelStore, model: &str) -> Result<PathBuf> {
     if let Ok(r) = store.resolve(model) {
         eprintln!("{} is available at {}", model, r.dir.display());
+        return Ok(r.dir);
+    }
+    if model.ends_with(".ckpt") {
+        // Draw Things checkpoint: download it and its text encoder / VAE from the public CDN.
+        let names: Vec<String> = std::iter::once(model.to_string()).chain(zoo::dt_dependencies(model)).collect();
+        let mut last = String::new();
+        for name in &names {
+            if store.local_file(name).is_some() {
+                continue;
+            }
+            eprintln!("downloading {name} from {} into {}", zoo::DT_CDN, store.primary_dir().display());
+            zoo::download_dt_ckpt(name, store.primary_dir(), &mut |file, done, total| {
+                let line = format!("  {file}: {:.0}%", if total > 0 { done as f64 * 100.0 / total as f64 } else { 0.0 });
+                if line != last {
+                    eprint!("\r{line}        ");
+                    last = line.clone();
+                }
+            })?;
+            eprintln!();
+        }
+        store.ensure_tokenizer()?;
+        let r = store.resolve(model)?;
+        eprintln!("{model} is available at {}", r.dir.display());
         return Ok(r.dir);
     }
     let repo = match store.find_spec(model) {
@@ -586,7 +697,7 @@ fn generate_local(a: &GenerateArgs, store: &ModelStore, prepared: Prepared) -> R
     if let Some(p) = &a.text_encoder_precision {
         precision.text_encoder = parse_dtype(p)?;
     }
-    let worker = Arc::new(Worker::spawn(store.clone(), EngineOptions { device, precision, keep_text_encoder: false, prompt_cache_size: 0, quantize: a.quantize }));
+    let worker = Arc::new(Worker::spawn(store.clone(), EngineOptions { device, precision, keep_text_encoder: false, prompt_cache_size: 0, quantize: a.quantize, keep_palettized: true }));
     let input = GenerationInput {
         config: prepared.config,
         prompt: prepared.prompt,

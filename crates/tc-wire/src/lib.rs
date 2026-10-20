@@ -169,13 +169,19 @@ pub fn decode(bytes: &[u8]) -> Result<WireTensor> {
     if shape.is_empty() {
         bail!("tensor has no dimensions");
     }
+    let data = decode_payload(codec, &bytes[HEADER..], dtype, &shape)?;
+    Ok(WireTensor { dtype, format, shape, data })
+}
+
+/// Decode a codec payload (raw, raw deflate or fpzip) into `shape` elements of `dtype`. Also
+/// used for tensors stored in nnc SQLite checkpoints, which use the same codec identifiers.
+pub fn decode_payload(codec: u32, payload: &[u8], dtype: WireType, shape: &[usize]) -> Result<Vec<u8>> {
     let n: usize = shape.iter().product();
     let size = n.checked_mul(dtype.size()).ok_or_else(|| anyhow!("tensor too large"))?;
     if size > 1 << 34 {
         bail!("tensor too large");
     }
-    let payload = &bytes[HEADER..];
-    let data = match codec {
+    Ok(match codec {
         CODEC_RAW => {
             if payload.len() < size {
                 bail!("tensor payload truncated");
@@ -190,10 +196,9 @@ pub fn decode(bytes: &[u8]) -> Result<WireTensor> {
             }
             out
         }
-        CODEC_FPZIP => fpzip_decode(payload, dtype, &shape)?,
+        CODEC_FPZIP => fpzip_decode(payload, dtype, shape)?,
         other => bail!("unsupported tensor codec {other:#x}"),
-    };
-    Ok(WireTensor { dtype, format, shape, data })
+    })
 }
 
 fn zip(data: &[u8]) -> Option<Vec<u8>> {

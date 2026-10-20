@@ -24,14 +24,20 @@ use crate::tokenizer::QwenTokenizer;
 /// Paths of the components of a FLUX.2 model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Flux2Files {
-    /// Transformer: a diffusers `transformer/` directory or a single safetensors file.
+    /// Transformer: a diffusers `transformer/` directory, a single safetensors file or a Draw
+    /// Things checkpoint (`.ckpt`).
     pub transformer: PathBuf,
+    /// Text encoder: a diffusers `text_encoder/` directory or a Draw Things checkpoint.
     pub text_encoder: PathBuf,
     pub tokenizer: PathBuf,
+    /// VAE: a diffusers `vae/` directory, a safetensors file or a Draw Things checkpoint.
     pub vae: PathBuf,
     pub scheduler_config: Option<PathBuf>,
     /// Step-distilled models ignore classifier-free guidance.
     pub is_distilled: bool,
+    /// FLUX.2 [klein] KV variant: reference images are conditioned "causally" (they attend only
+    /// to themselves, at timestep 0) and placed before the target tokens.
+    pub kv: bool,
 }
 
 impl Flux2Files {
@@ -57,6 +63,7 @@ impl Flux2Files {
             vae: need(dir.join("vae"))?,
             scheduler_config: scheduler.exists().then_some(scheduler),
             is_distilled,
+            kv: index.get("_class_name").and_then(|v| v.as_str()) == Some("Flux2KleinKVPipeline"),
         })
     }
 }
@@ -93,12 +100,22 @@ pub struct EngineOptions {
     /// Store transformer and text encoder linear weights 8-bit palettized (about half the
     /// memory; LoRAs then run as separate low-rank branches instead of being merged).
     pub quantize: bool,
+    /// Keep weights that a Draw Things checkpoint stores 8-bit palettized (q8p) in that form
+    /// (as if `quantize` were set for that component) instead of expanding them.
+    pub keep_palettized: bool,
 }
 
 impl Default for EngineOptions {
     fn default() -> Self {
         let device = nnc::default_device();
-        EngineOptions { device, precision: Precision::default_for(device), keep_text_encoder: false, prompt_cache_size: 8, quantize: false }
+        EngineOptions {
+            device,
+            precision: Precision::default_for(device),
+            keep_text_encoder: false,
+            prompt_cache_size: 8,
+            quantize: false,
+            keep_palettized: true,
+        }
     }
 }
 
@@ -268,6 +285,16 @@ impl Flux2Engine {
         self.graph.garbage_collect();
     }
 
+    /// Metal's palettized GEMM needs activations in the palette type and has no bf16 kernels.
+    fn effective_dtype(&self, dtype: DataType, quantized: bool) -> DataType {
+        if quantized && self.options.device.is_gpu() && dtype == DataType::BF16 {
+            info!("8-bit palettized weights on GPU: running in f16 (Metal has no bf16 palette kernels)");
+            DataType::F16
+        } else {
+            dtype
+        }
+    }
+
     fn files(&self) -> Result<&Flux2Files> {
         self.files.as_ref().context("no model selected")
     }
@@ -281,7 +308,9 @@ impl Flux2Engine {
         self.graph.garbage_collect();
         let t0 = Instant::now();
         let (source, config) = open_source(&files.transformer)?;
-        let model = Flux2::load(&self.graph, &source, config, self.options.device, self.options.precision.transformer, self.options.quantize)?;
+        let quantize = self.options.quantize || (self.options.keep_palettized && source.has_palettized());
+        let dtype = self.effective_dtype(self.options.precision.transformer, quantize);
+        let model = Flux2::load(&self.graph, &source, config, self.options.device, dtype, quantize)?;
         info!("loaded transformer {} in {:.1}s", files.transformer.display(), t0.elapsed().as_secs_f32());
         self.transformer = Some(LoadedTransformer { files: files.transformer, source, model, applied: vec![], touched: vec![] });
         Ok(())
@@ -355,14 +384,13 @@ impl Flux2Engine {
         if self.text_encoder.is_none() {
             let t0 = Instant::now();
             let layers = *TEXT_ENCODER_LAYERS.iter().max().unwrap();
-            self.text_encoder = Some(Qwen3::load(
-                &self.graph,
-                &files.text_encoder,
-                layers,
-                self.options.device,
-                self.options.precision.text_encoder,
-                self.options.quantize,
-            )?);
+            let palettized = self.options.keep_palettized && crate::ckpt::is_ckpt(&files.text_encoder) && {
+                let f = crate::ckpt::CkptFile::open(&files.text_encoder)?;
+                f.info("__text_model__[t-q_proj-0-0]").map(|i| i.codec == crate::ckpt::CODEC_Q8P).unwrap_or(false)
+            };
+            let quantize = self.options.quantize || palettized;
+            let dtype = self.effective_dtype(self.options.precision.text_encoder, quantize);
+            self.text_encoder = Some(Qwen3::load(&self.graph, &files.text_encoder, layers, self.options.device, dtype, quantize)?);
             info!("loaded text encoder in {:.1}s", t0.elapsed().as_secs_f32());
         }
         let text = QwenTokenizer::chat_prompt(prompt);
@@ -469,9 +497,16 @@ impl Flux2Engine {
         let cond_v = graph.from_host(&cond, device).to_dtype(dtype);
         let uncond_v = uncond.as_ref().map(|u| graph.from_host(u, device).to_dtype(dtype));
         let txt_len = cond.shape()[1];
+        let kv = self.files()?.kv && !refs.is_empty();
         let mut ids = text_ids(txt_len);
-        ids.extend(image_ids(lh, lw, 0.0));
-        ids.extend(ref_ids.iter().copied());
+        if kv {
+            // KV variant: reference tokens come before the target tokens.
+            ids.extend(ref_ids.iter().copied());
+            ids.extend(image_ids(lh, lw, 0.0));
+        } else {
+            ids.extend(image_ids(lh, lw, 0.0));
+            ids.extend(ref_ids.iter().copied());
+        }
         let (rope, rope_shape) = rope_table(&ids, &config.axes_dims_rope, config.rope_theta);
         let rope = graph.from_f32(&rope, &rope_shape, device, dtype);
         let refs_cat = if refs.is_empty() {
@@ -494,6 +529,8 @@ impl Flux2Engine {
             bail!("strength {} leaves no denoising steps", p.strength);
         }
 
+        let n_ref = refs_cat.as_ref().map(|r| r.dim(1)).unwrap_or(0);
+        let ref_step = if kv { Some(model.prepare_step(&[0.0], None)) } else { None };
         let mut images = vec![];
         for n in 0..p.num_images.max(1) {
             let seed = p.seed.wrapping_add(n as u64);
@@ -525,19 +562,16 @@ impl Flux2Engine {
                 let s_next = sig[i + 1];
                 let step = model.prepare_step(&[(s * 1000.0) as f32], None);
                 let xin = x.to_dtype(dtype);
-                let xin = match &refs_cat {
-                    Some(r) => ops::concat(&[&xin, r], 1),
-                    None => xin,
-                };
-                let mut v = model.forward(&xin, &cond_v, &step, &rope);
-                if refs_cat.is_some() {
-                    v = v.narrow(1, 0, n_tokens).contiguous();
-                }
-                if let Some(u) = &uncond_v {
-                    let mut vu = model.forward(&xin, u, &step, &rope);
-                    if refs_cat.is_some() {
-                        vu = vu.narrow(1, 0, n_tokens).contiguous();
+                let run = |txt: &Var| -> Var {
+                    match (&refs_cat, &ref_step) {
+                        (Some(r), Some(rs)) => model.forward_kv(&ops::concat(&[r, &xin], 1), txt, &step, rs, n_ref, &rope),
+                        (Some(r), None) => model.forward(&ops::concat(&[&xin, r], 1), txt, &step, &rope).narrow(1, 0, n_tokens).contiguous(),
+                        (None, _) => model.forward(&xin, txt, &step, &rope),
                     }
+                };
+                let mut v = run(&cond_v);
+                if let Some(u) = &uncond_v {
+                    let vu = run(u);
                     // uncond + g * (cond - uncond)
                     let d = ops::sub(&v, &vu);
                     v = ops::add_scaled(&vu, &d, 1.0, p.guidance_scale);

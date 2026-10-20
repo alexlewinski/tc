@@ -21,7 +21,7 @@ If the server has a shared secret, every request must carry it in `sharedSecret`
 
 `message = "HELLO <name>"`, `serverIdentifier` = random 64-bit id fixed for the server's
 lifetime. With `--model-browser`, `files` lists locally available models (registry ids) and
-`*.safetensors` files in the models directories, and `override.models` holds a JSON array
+`*.safetensors` / `*.ckpt` files in the models directories, and `override.models` holds a JSON array
 describing the available models.
 
 ### `FilesExist(FileListRequest) -> FileExistenceResponse`
@@ -204,12 +204,13 @@ precision (lossless for f16). Images are NHWC `[1, H, W, 3]` floats in `[-1, 1]`
 
 ### `draw-things-cli generate`
 
-`--model` (registry id, alias, display name, `owner/repo`, `hf://owner/repo`, Hugging Face URL
-or snapshot path), `--prompt` / `--prompt-file` (`-` = stdin), `--negative-prompt` /
+`--model` (registry id, alias, display name, `owner/repo`, `hf://owner/repo`, Hugging Face URL,
+snapshot path, or a Draw Things checkpoint file name / path such as
+`flux_2_klein_9b_kv_q8p.ckpt`), `--prompt` / `--prompt-file` (`-` = stdin), `--negative-prompt` /
 `--negative-prompt-file`, `--steps`, `--cfg`, `--width`, `--height` (multiples of 64),
 `--strength`, `--seed`, `--config-json`, `--config-file`, `--image` (repeatable; the first is the
 canvas, the rest are references; `--init-image` / `--input-image` are aliases), `--crop`,
-`--lora FILE[:WEIGHT]` (repeatable), `-o/--output` (`.png`; multiple images get `-N` suffixes),
+`--lora FILE[:WEIGHT]` (repeatable; `.safetensors` or Draw Things `.ckpt`), `-o/--output` (`.png`; multiple images get `-N` suffixes),
 `--terminal-image`, `--terminal-image-protocol auto|iterm2|kitty`, `--[no-]download-missing`,
 `--disable-preview`, `--offline`, `--local`, `--remote`, `--remote-url`, `--remote-port`,
 `--[no-]remote-tls`, `--remote-shared-secret`, `--precision`, `--text-encoder-precision`, `--cpu`, `--quantize`.
@@ -219,9 +220,29 @@ Precedence: model recommendations < JSON overrides < explicit flags. Without `--
 and estimate options are rejected with an explanatory error.
 
 `draw-things-cli models list [--downloaded-only]`, `models ensure --model M` (downloads the
-diffusers components from Hugging Face; `HF_TOKEN` for gated repos), `models import FILE
---base M` (registers a fine-tuned transformer that reuses a base model's other components),
-`completion bash|zsh|fish|elvish|powershell`.
+diffusers components from Hugging Face, `HF_TOKEN` for gated repos; for a `*.ckpt` name, downloads
+it and its text encoder and VAE from the Draw Things CDN, checking SHA-256 against the published
+manifest), `models import FILE --base M` (registers a fine-tuned transformer that reuses a base
+model's other components), `models inspect FILE [--lora L ...]` (describes a Draw Things
+checkpoint: component, encodings, resolved companion files, LoRA coverage), `models compare CKPT
+REFERENCE [--filter S] [--all]` (tensor-by-tensor comparison of a Draw Things checkpoint with the
+official release; for a Draw Things LoRA, comparison of its weight updates with the original
+LoRA file), `completion bash|zsh|fish|elvish|powershell`.
+
+### Draw Things checkpoint files
+
+A Draw Things model in a models directory is a set of `.ckpt` files (nnc SQLite tensor stores):
+the transformer (e.g. `flux_2_klein_9b_kv_q8p.ckpt`), a Qwen3 text encoder `qwen_3_*.ckpt`
+whose hidden size matches the transformer (`qwen_3_8b_*` for 9B, `qwen_3_4b_*` for 4B), and the
+VAE `flux_2_vae*.ckpt`, preferring `_q8p`, then `_f16`, then other encodings. A checkpoint may keep
+its tensor data in a `<file>-tensordata` sidecar or appended to the database. The Qwen3
+tokenizer is not part of these files: it is taken from any local FLUX.2 snapshot or
+`<models-dir>/flux_2_tokenizer/`, and otherwise downloaded there once (~11 MB, from the
+Apache-2.0 `black-forest-labs/FLUX.2-klein-4B` repository). Files whose name contains `_kv`
+(FLUX.2 [klein] 9B-KV) use the KV-variant reference-image conditioning. Weights stored 8-bit
+palettized (`q8p`) stay palettized in memory on the GPU (which then runs in f16), as with
+`--quantize`. Supported encodings: raw, zip, fpzip, ezm7, q8p; others (q6p, i8x, ...) give an error
+naming the encoding.
 
 ### `gRPCServerCLI <models-dir>`
 

@@ -10,8 +10,9 @@ Fast local **FLUX.2** image generation in Rust, primarily for **Apple Silicon Ma
 The compute backend is [ccv / nnc](https://github.com/liuliu/ccv) (vendored C, BSD-3) with its
 Metal (MPS + Metal FlashAttention) backend on macOS and a CPU backend elsewhere.
 
-Supported models: **FLUX.2 [klein] 9B / 4B** (distilled and base) from the official Hugging
-Face releases, with any number of LoRAs (diffusers/PEFT, ai-toolkit/BFL and kohya formats).
+Supported models: **FLUX.2 [klein] 9B / 9B-KV / 4B** (distilled and base), either from the
+official Hugging Face releases or as the `.ckpt` files Draw Things keeps in its models folder,
+with any number of LoRAs (Draw Things `.ckpt`, diffusers/PEFT, ai-toolkit/BFL and kohya formats).
 
 > Tonic Clap is an independent clean-room implementation, released under the BSD 3-Clause
 > license. It is not affiliated with Draw Things or Black Forest Labs. See
@@ -51,12 +52,51 @@ the first image instead initializes the latent (image-to-image). Without `--widt
 the output size follows the first image (rounded to multiples of 64).
 
 The models directory defaults to `$DRAWTHINGS_MODELS_DIR`, then `<binary dir>/Models`, then
-`~/Documents/Models`; override with `--models-dir`. A model is a Hugging Face snapshot in
+`~/Documents/Models`; override with `--models-dir`. A model is either a Hugging Face snapshot in
 diffusers layout (`model_index.json`, `transformer/`, `text_encoder/`, `tokenizer/`, `vae/`,
-`scheduler/`), stored as `<models-dir>/FLUX.2-klein-9B/` or found in the Hugging Face cache.
-Pointing `--models-dir` at the Draw Things models folder works (snapshots and files coexist),
-but Draw Things' own converted weights (`*.ckpt`, a SQLite format) are not read: models must be
-the diffusers release, and LoRAs the original `.safetensors` files.
+`scheduler/`), stored as `<models-dir>/FLUX.2-klein-9B/` or found in the Hugging Face cache, or a
+Draw Things checkpoint (below).
+
+## Using a Draw Things models folder
+
+Draw Things' own files work directly: name the transformer `.ckpt` as the model and the
+LoRA `.ckpt` files as LoRAs. The matching Qwen3 text encoder (`qwen_3_8b_*.ckpt` for 9B, including
+a `-tensordata` sidecar) and VAE (`flux_2_vae_f16.ckpt`) are found next to it. The Qwen3 tokenizer
+is not part of Draw Things' files; it is downloaded once (~11 MB) into
+`<models-dir>/flux_2_tokenizer/` unless a FLUX.2 snapshot is present.
+
+```sh
+# Draw Things' usual models folder (Settings shows the actual location if you moved it)
+DT="$HOME/Library/Containers/com.liuliu.draw-things/Data/Documents/Models"
+./target/release/draw-things-cli generate --models-dir "$DT" \
+  --model flux_2_klein_9b_kv_q8p.ckpt \
+  --lora nnegrat_ink_9b_2250_lora_f16.ckpt:0.8 \
+  --lora replace_outfit_v1_000005750_lora_f16.ckpt:1.0 \
+  --image croquis.png --image outfit.png \
+  --prompt "Have the croquis on image 1 wear the outfit on image 2, while keeping the croquis unchanged" \
+  --seed 42 -o out.png
+
+./target/release/draw-things-cli models inspect --models-dir "$DT" flux_2_klein_9b_kv_q8p.ckpt \
+  --lora nnegrat_ink_9b_2250_lora_f16.ckpt --lora replace_outfit_v1_000005750_lora_f16.ckpt
+```
+
+* `flux_2_klein_9b_kv_*` is **FLUX.2 [klein] 9B-KV** (black-forest-labs/FLUX.2-klein-9b-kv): the
+  9B model trained so that reference images can be KV-cached. Its reference tokens are placed
+  before the image, modulated at timestep 0 and attend only to themselves, as in diffusers'
+  `Flux2KleinKVPipeline` (Tonic Clap computes this exactly, without the cache).
+* 8-bit palettized (`q8p`) weights are used as stored, as with `--quantize` (on the GPU this runs
+  in f16), so the 9B model needs about as much memory as in Draw Things.
+* `models ensure --model flux_2_klein_9b_kv_q8p.ckpt` downloads a model and its text encoder and
+  VAE from the Draw Things CDN (`https://static.libnnc.org/<file>`), verifying the SHA-256 from
+  `https://models.drawthings.ai/models_sha256.json`.
+* Supported encodings: raw, zip, fpzip, ezm7 and q8p (all FLUX.2 [klein] `_q8p` / `_f16` files and
+  the LoRA files Draw Things writes); `_q6p` / `_i8x` files are reported as unsupported.
+* `models compare CKPT REFERENCE` checks a checkpoint against the official release tensor by
+  tensor, and a Draw Things LoRA against its original `.safetensors` (relative difference of the
+  weight updates and best-fit scale).
+
+The gRPC server reads the same files: put the `.ckpt` names in the request configuration
+(`"model": "flux_2_klein_9b_kv_q8p.ckpt"`, `"loras": [{"file": "nnegrat_ink_9b_2250_lora_f16.ckpt", ...}]`).
 
 ## Serving over gRPC
 
@@ -118,7 +158,7 @@ bf16 on Metal needs macOS 15 or later.
 | `crates/tc-service` | model registry, request mapping, worker thread |
 | `crates/tc-grpc` | gRPC server and client |
 | `apps/draw-things-cli`, `apps/grpc-server-cli` | the binaries |
-| `scripts/` | reference-fixture generators (PyTorch / diffusers) used by the tests |
+| `scripts/` | reference-fixture generators (PyTorch / diffusers) used by the tests; `scripts/ckpt/` verification of the Draw Things checkpoint mapping against official weights |
 
 ## Testing
 
@@ -127,7 +167,12 @@ Qwen3, VAE), LoRA merging, the scheduler, the seeded noise and the full pipeline
 PyTorch / diffusers / transformers references produced by `scripts/fixtures/*.py` (fixtures are
 checked in, so Python isn't needed to run the tests). End-to-end tests drive a tiny FLUX.2
 [klein] snapshot with two LoRAs, with and without a reference image, through the real
-`draw-things-cli` binary and through a gRPC server and client.
+`draw-things-cli` binary and through a gRPC server and client, both from the diffusers snapshot
+and from the same model written as Draw Things `.ckpt` files (with a Draw Things-layout LoRA).
+Draw Things checkpoint reading (inline, `-tensordata` sidecar and trailer stores; raw, zip,
+fpzip, ezm7 and q8p tensors) and the transformer, Qwen3, VAE and LoRA mappings have their own
+unit tests; their verification against the real published files is described in
+[docs/PROVENANCE.md](docs/PROVENANCE.md).
 
 ### Checking Metal on your Mac
 

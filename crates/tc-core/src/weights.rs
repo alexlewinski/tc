@@ -192,6 +192,46 @@ impl SafeTensorsFiles {
     }
 }
 
+/// Named tensors from any supported container (safetensors files, or a Draw Things checkpoint
+/// viewed under canonical names).
+pub trait TensorSource: Send + Sync {
+    fn names(&self) -> Vec<String>;
+    fn shape(&self, name: &str) -> Option<Vec<usize>>;
+    /// Read a tensor converted to `dtype`.
+    fn read(&self, name: &str, dtype: DataType) -> Result<HostTensor>;
+    /// Read a tensor in its stored form (palettized tensors are kept palettized).
+    fn read_raw(&self, name: &str) -> Result<crate::ckpt::CkptTensor> {
+        Ok(crate::ckpt::CkptTensor::Dense(self.read(name, DataType::F32)?))
+    }
+    fn contains(&self, name: &str) -> bool {
+        self.shape(name).is_some()
+    }
+    fn read_f32(&self, name: &str) -> Result<Vec<f32>> {
+        Ok(self.read(name, DataType::F32)?.to_f32_vec())
+    }
+}
+
+impl TensorSource for SafeTensorsFiles {
+    fn names(&self) -> Vec<String> {
+        self.keys().cloned().collect()
+    }
+    fn shape(&self, name: &str) -> Option<Vec<usize>> {
+        self.info(name).map(|i| i.shape.clone())
+    }
+    fn read(&self, name: &str, dtype: DataType) -> Result<HostTensor> {
+        SafeTensorsFiles::read(self, name, dtype)
+    }
+    fn read_raw(&self, name: &str) -> Result<crate::ckpt::CkptTensor> {
+        let info = self.info(name).ok_or_else(|| anyhow!("tensor {name} not found"))?;
+        let dtype = match info.dtype {
+            StDtype::F16 => DataType::F16,
+            StDtype::BF16 => DataType::BF16,
+            _ => DataType::F32,
+        };
+        Ok(crate::ckpt::CkptTensor::Dense(SafeTensorsFiles::read(self, name, dtype)?))
+    }
+}
+
 fn f8e4m3_to_f32(b: u8) -> f32 {
     let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
     let exp = ((b >> 3) & 0xF) as i32;
@@ -325,12 +365,4 @@ pub fn conv_weight_to_nhwc(w: &[f32], shape: &[usize]) -> (Vec<f32>, Vec<usize>)
         }
     });
     (out, vec![o, kh, kw, i])
-}
-
-/// Whether `path` is a SQLite database (the Draw Things `.ckpt` weight format), which is not
-/// supported; used to give a clear error instead of a safetensors parse failure.
-pub fn is_sqlite_checkpoint(path: &Path) -> bool {
-    use std::io::Read;
-    let mut magic = [0u8; 16];
-    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && &magic == b"SQLite format 3\0"
 }

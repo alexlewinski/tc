@@ -26,13 +26,17 @@ fn safetensors_header(bytes: &[u8]) -> Vec<f32> {
 /// Runs `generate` on the tiny snapshot with two LoRAs plus `extra` arguments; returns the PNG
 /// as floats in `[0, 1]`.
 fn generate(name: &str, extra: &[&str]) -> Vec<f32> {
+    generate_with(name, &fixtures(), "tiny-klein", ["lora_a.safetensors:0.8", "lora_b.safetensors:0.5"], extra)
+}
+
+fn generate_with(name: &str, models_dir: &std::path::Path, model: &str, loras: [&str; 2], extra: &[&str]) -> Vec<f32> {
     let out = std::env::temp_dir().join(format!("tc-e2e-{name}-{}.png", std::process::id()));
     let status = Command::new(env!("CARGO_BIN_EXE_draw-things-cli"))
-        .args(["generate", "--offline", "--disable-preview", "--model", "tiny-klein"])
+        .args(["generate", "--offline", "--disable-preview", "--model", model])
         .arg("--models-dir")
-        .arg(fixtures())
+        .arg(models_dir)
         .args(["--prompt", "a red cube on a table", "--steps", "3", "--width", "128", "--height", "64", "--seed", "7"])
-        .args(["--lora", "lora_a.safetensors:0.8", "--lora", "lora_b.safetensors:0.5"])
+        .args(["--lora", loras[0], "--lora", loras[1]])
         .args(extra)
         .arg("-o")
         .arg(&out)
@@ -63,6 +67,27 @@ fn cli_generate_with_two_loras_matches_reference() {
 fn cli_generate_with_two_loras_and_reference_image_matches_reference() {
     let reference = fixtures().join("ref.png");
     let (max, _) = error(&generate("loras-ref", &["--cpu", "--image", reference.to_str().unwrap()]), "expected_ref.safetensors");
+    assert!(max <= 1.5 / 255.0, "max pixel error {max}");
+}
+
+/// The tiny model as a Draw Things models folder: transformer, `qwen_3_*.ckpt` text encoder and
+/// VAE as `.ckpt` files (f32), the tokenizer in `flux_2_tokenizer/`, and the second LoRA converted
+/// to Draw Things' LoRA layout (`__dit__[...]__down__` / `__up__`, alpha folded in).
+fn draw_things_models_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("tc-e2e-dt-models-{}", std::process::id()));
+    tc_service::testing::write_tiny_draw_things_models(&fixtures(), &dir).unwrap();
+    dir
+}
+
+#[test]
+fn cli_generate_with_draw_things_checkpoints_matches_reference() {
+    let dir = draw_things_models_dir();
+    let loras = ["lora_a.safetensors:0.8", "lora_b_dt.ckpt:0.5"];
+    let (max, _) = error(&generate_with("dt", &dir, "flux_2_klein_tiny_f32.ckpt", loras, &["--cpu"]), "expected.safetensors");
+    assert!(max <= 1.5 / 255.0, "max pixel error {max}");
+    let reference = fixtures().join("ref.png");
+    let got = generate_with("dt-ref", &dir, "flux_2_klein_tiny_f32.ckpt", loras, &["--cpu", "--image", reference.to_str().unwrap()]);
+    let (max, _) = error(&got, "expected_ref.safetensors");
     assert!(max <= 1.5 / 255.0, "max pixel error {max}");
 }
 
