@@ -34,7 +34,21 @@ export HF_TOKEN=hf_...
   --width 1024 --height 1024 --seed 42 \
   --lora my_style.safetensors:0.8 --lora my_subject.safetensors:0.6 \
   -o cube.png
+
+# Edit / reference-guided generation: the same, plus a reference image
+./target/release/draw-things-cli generate \
+  --model flux_2_klein_9b \
+  --prompt "the subject from the reference image sitting on a wooden table, studio light" \
+  --image reference.png \
+  --width 1024 --height 1024 --seed 42 \
+  --lora my_style.safetensors:0.8 --lora my_subject.safetensors:0.6 \
+  -o edit.png
 ```
+
+`--image` adds a reference image (repeat it for several). With the default `--strength 1` it
+conditions FLUX.2's editing path and the output starts from noise; with `--strength` below 1
+the first image instead initializes the latent (image-to-image). Without `--width`/`--height`
+the output size follows the first image (rounded to multiples of 64).
 
 The models directory defaults to `$DRAWTHINGS_MODELS_DIR`, then `<binary dir>/Models`, then
 `~/Documents/Models`; override with `--models-dir`. A model is a Hugging Face snapshot in
@@ -56,8 +70,14 @@ names the model and LoRAs:
 draw-things-cli generate --remote --remote-url 192.168.1.20 --no-remote-tls \
   --remote-shared-secret mysecret --model flux_2_klein_9b --prompt "a red cube" \
   --config-json '{"loras":[{"file":"my_style.safetensors","weight":0.8},{"file":"my_subject.safetensors","weight":0.6}]}' \
+  --image reference.png \
   -o cube.png
 ```
+
+The client sends the first `--image` as the request's canvas image when its aspect ratio
+matches the output, otherwise as a `shuffle` hint (further images always go as hints); with
+`strength` 1 the server uses either as a FLUX.2 reference image. See
+[docs/INTERFACE.md](docs/INTERFACE.md).
 
 Writing your own client: see [docs/INTERFACE.md](docs/INTERFACE.md) for the protocol
 (`proto/image_service.proto`), the `GenerationConfiguration` FlatBuffer, and the image tensor
@@ -102,9 +122,9 @@ bf16 on Metal needs macOS 15 or later.
 `cargo test --workspace` runs everything on CPU. The tests compare each op, each model (FLUX.2,
 Qwen3, VAE), LoRA merging, the scheduler, the seeded noise and the full pipeline against
 PyTorch / diffusers / transformers references produced by `scripts/fixtures/*.py` (fixtures are
-checked in, so Python isn't needed to run the tests). Two end-to-end tests drive a tiny FLUX.2
-[klein] snapshot with two LoRAs through the real `draw-things-cli` binary and through a gRPC
-server and client.
+checked in, so Python isn't needed to run the tests). End-to-end tests drive a tiny FLUX.2
+[klein] snapshot with two LoRAs, with and without a reference image, through the real
+`draw-things-cli` binary and through a gRPC server and client.
 
 With the same seed, outputs match `diffusers`' `Flux2KleinPipeline` (the initial noise
 reproduces `torch.randn` on CPU).

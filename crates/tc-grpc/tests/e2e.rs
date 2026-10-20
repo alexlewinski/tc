@@ -16,8 +16,8 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tc-service/tests/fixtures")
 }
 
-fn expected() -> Vec<f32> {
-    let bytes = std::fs::read(fixtures().join("expected.safetensors")).unwrap();
+fn expected(file: &str) -> Vec<f32> {
+    let bytes = std::fs::read(fixtures().join(file)).unwrap();
     let n = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
     let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + n]).unwrap();
     let offs = header["image"]["data_offsets"].as_array().unwrap();
@@ -98,9 +98,25 @@ async fn grpc_generate_echo_files_and_upload() {
     assert_eq!(t.shape, vec![1, 64, 128, 3]);
     assert_eq!(t.dtype, tc_wire::WireType::F16);
     let got: Vec<f32> = t.to_f32().iter().map(|v| (v / 2.0 + 0.5).clamp(0.0, 1.0)).collect();
-    let exp = expected();
+    let exp = expected("expected.safetensors");
     let max = got.iter().zip(exp.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
     assert!(max < 2e-3, "max error {max}");
+
+    // Two LoRAs plus a reference image, sent both ways a client may send it: as the canvas
+    // image (strength 1 keeps it a reference) and as a "shuffle" hint.
+    let reference = {
+        let t = tc_core::image_io::to_tensor(&tc_core::image_io::load_rgb(&fixtures().join("ref.png")).unwrap());
+        tc_wire::encode(&tc_wire::WireTensor::from_f32(&t.to_f32_vec(), t.shape(), tc_wire::WireType::F16), tc_wire::Compression::FpzipOrZip)
+    };
+    let exp = expected("expected_ref.safetensors");
+    for (image, hints) in [(Some(reference.clone()), vec![]), (None, vec![reference.clone()])] {
+        let result = client.generate(config().to_flatbuffer(), "a red cube on a table", "", image, hints, |_| {}).await.unwrap();
+        let t = &result.images[0];
+        assert_eq!(t.shape, vec![1, 64, 128, 3]);
+        let got: Vec<f32> = t.to_f32().iter().map(|v| (v / 2.0 + 0.5).clamp(0.0, 1.0)).collect();
+        let max = got.iter().zip(exp.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(max < 2e-3, "reference image: max error {max}");
+    }
 
     // Raw stub for the remaining RPCs.
     let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}")).unwrap().connect().await.unwrap();
