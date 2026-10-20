@@ -1,6 +1,6 @@
 mod common;
 use common::*;
-use nnc::{DataType, Device, Graph};
+use nnc::{DataType, Graph};
 use tc_core::models::qwen3::Qwen3;
 use tc_core::weights::SafeTensorsFiles;
 

@@ -1,6 +1,6 @@
 mod common;
 use common::*;
-use nnc::{DataType, Device, Graph};
+use nnc::{DataType, Graph};
 use tc_core::models::flux2_vae::Flux2Vae;
 use tc_core::weights::SafeTensorsFiles;
 
