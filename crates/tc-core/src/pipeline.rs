@@ -342,7 +342,7 @@ impl Flux2Engine {
     }
 
     /// Prompt embedding `[1, L, 3*hidden]` on the host (f32).
-    fn encode_prompt(&mut self, prompt: &str, max_len: usize) -> Result<HostTensor> {
+    pub fn encode_prompt(&mut self, prompt: &str, max_len: usize) -> Result<HostTensor> {
         if let Some((_, _, t)) = self.prompt_cache.iter().find(|(p, l, _)| p == prompt && *l == max_len) {
             return Ok(t.clone());
         }
