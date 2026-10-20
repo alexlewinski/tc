@@ -143,7 +143,10 @@ impl Graph {
         gp.type_ = device.to_raw_type();
         let gpu = self.new_with_params(gp);
         crate::ops::data_transfer(&cpu, &gpu);
-        gpu.keep_alive(cpu)
+        // Wait for the copy and let the host staging copy go: keeping it alive with the weight
+        // would hold every palettized weight twice in (unified) memory.
+        self.synchronize();
+        gpu
     }
 }
 

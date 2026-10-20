@@ -250,3 +250,32 @@ fn norms_f16_gpu() {
     let (xg, gg, gb) = (h("gn.x"), h("gn.g"), h("gn.b"));
     check(&fx, &ops::group_norm(&xg, 3, 8, &[1, 2], 1e-6, Some((&gg, &gb))).to_dtype(DataType::F32), "gn.out", 2e-2);
 }
+
+/// Palettized (8-bit, QX) weights consumed directly by the GPU GEMM, against the same product
+/// with the depalettized weights. GPU only: on CPU palettized weights are expanded at load.
+#[test]
+fn palettized_linear_gpu() {
+    if !device().is_gpu() {
+        return;
+    }
+    let g = Graph::new();
+    g.use_gpu_stream();
+    // (rows = out features, cols = in features, tokens, block)
+    for (rows, cols, tokens, block) in [(64, 64, 8, 1024), (256, 128, 17, 1024), (1024, 512, 33, 16384), (4096, 4096, 64, 16384), (12288, 4096, 16, 16384), (4096, 12288, 16, 16384)] {
+        let n = rows * cols;
+        let w: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.618).sin() * 0.05).collect();
+        let x: Vec<f32> = (0..tokens * cols).map(|i| ((i as f32) * 0.37).cos()).collect();
+        let host = HostTensor::from_f32(&w, &[rows, cols]).to_dtype(DataType::F16);
+        let q = nnc::quant::palettize8_fast(&host, block);
+        let dense = nnc::quant::depalettize(&q, DataType::F16, &[rows, cols], 8, block);
+        let xv = g.from_f32(&x, &[tokens, cols], device(), DataType::F16);
+        let wq = g.from_palettized(&q, DataType::F16, &[rows, cols], 8, block, device());
+        let wd = g.from_host(&dense, device());
+        let got = ops::linear(&xv, &wq, None).to_f32_vec();
+        let exp = ops::linear(&xv, &wd, None).to_f32_vec();
+        let scale = exp.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+        let max = got.iter().zip(&exp).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        eprintln!("palettized {rows}x{cols} tokens {tokens} block {block}: max error {max:.5} (max |ref| {scale:.3})");
+        assert!(got.iter().all(|v| v.is_finite()) && max <= 2e-2 * scale, "palettized {rows}x{cols} block {block}: max error {max} vs {scale}");
+    }
+}

@@ -417,20 +417,6 @@ impl Var {
         out
     }
 
-    pub(crate) fn keep_alive(self, keep: Var) -> Var {
-        self.with_keepalive(keep)
-    }
-
-    fn with_keepalive(self, keep: Var) -> Var {
-        match Rc::try_unwrap(self.inner) {
-            Ok(mut inner) => {
-                inner._parent = Some(keep);
-                Var { inner: Rc::new(inner) }
-            }
-            Err(inner) => Var { inner },
-        }
-    }
-
     /// Convert element type.
     pub fn to_dtype(&self, dtype: DataType) -> Var {
         if self.dtype() == dtype {
