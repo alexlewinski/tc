@@ -263,7 +263,11 @@ pub fn group_norm(
     p.__bindgen_anon_1.gnorm.epsilon = eps;
     p.__bindgen_anon_1.gnorm.elementwise_affine = scale_bias.is_some() as i32;
     let g = x.graph().clone();
-    let inputs: Vec<Option<&Var>> = match scale_bias {
+    // Scale and bias must have the input's rank with the channels on `group_axis`: the Metal
+    // kernel splits that axis into groups (a flat `[C]` only works on CPU).
+    let affine_shape: Vec<usize> = (0..x.rank()).map(|i| if i == group_axis { x.dim(i) } else { 1 }).collect();
+    let affine = scale_bias.map(|(s, b)| (s.reshape(&affine_shape), b.reshape(&affine_shape)));
+    let inputs: Vec<Option<&Var>> = match &affine {
         Some((s, b)) => vec![Some(x), Some(s), Some(b)],
         None => vec![Some(x)],
     };

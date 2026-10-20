@@ -94,12 +94,28 @@ fn attention() {
     let k = fx.var(&g, "attn.k");
     let v = fx.var(&g, "attn.v");
     check(&fx, &ops::scaled_dot_product_attention(&q, &k, &v, 0.3, false, None), "attn.out", 1e-4);
+}
+
+#[test]
+fn attention_causal() {
+    let fx = Fixtures::load();
+    let g = Graph::new();
     let q = fx.var(&g, "attnc.q");
     let k = fx.var(&g, "attnc.k");
     let v = fx.var(&g, "attnc.v");
     let s = 1.0 / (8f32).sqrt();
     check(&fx, &ops::scaled_dot_product_attention(&q, &k, &v, s, true, None), "attnc.out", 1e-4);
+}
+
+#[test]
+fn attention_masked() {
+    let fx = Fixtures::load();
+    let g = Graph::new();
+    let q = fx.var(&g, "attnc.q");
+    let k = fx.var(&g, "attnc.k");
+    let v = fx.var(&g, "attnc.v");
     let m = fx.var(&g, "attnm.mask");
+    let s = 1.0 / (8f32).sqrt();
     check(&fx, &ops::scaled_dot_product_attention(&q, &k, &v, s, false, Some(&m)), "attnm.out", 1e-4);
 }
 
