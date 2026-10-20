@@ -35,9 +35,8 @@ jobs:
         run: cargo build --workspace --all-targets
       - name: Test (CPU)
         run: cargo test --workspace
-      - name: Metal op tests
+      - name: Metal tests
         if: runner.os == 'macOS'
-        continue-on-error: true   # informational until the Metal path is green
         run: |
           cargo run -q -p nnc --example devices
           NNC_TEST_DEVICE=gpu cargo test --no-fail-fast -p nnc -p tc-core -p tc-service -p draw-things-cli -- --test-threads=1

@@ -112,12 +112,16 @@ fn gpu_precision_matrix() {
     // Stage 1: text embeddings, GPU vs CPU.
     let prompt = "a red cube on a table";
     let cpu_emb = engine(Device::Cpu, Precision::default_for(Device::Cpu)).0.encode_prompt(prompt, 512).unwrap();
-    for (label, te) in [("f32", F32), ("f16", F16), ("bf16", BF16)] {
+    // Bounds relative to the largest |value|, after 27 Qwen3 layers. Measured on Metal (GitHub
+    // macos-15 runner): f32 exact, f16 0.6%, bf16 5.1%; bf16 keeps 3 fewer mantissa bits than f16
+    // (8x coarser) and its error is ~8.6x f16's, i.e. rounding, not a kernel bug. The images
+    // these embeddings produce stay within the stage-3 bounds.
+    for (label, te, rel) in [("f32", F32, 1e-3), ("f16", F16, 0.02), ("bf16", BF16, 0.1)] {
         let gpu_emb = engine(Device::Gpu(0), p(F32, te, F32)).0.encode_prompt(prompt, 512).unwrap();
         let (max, mean, nans) = error(&gpu_emb.to_f32_vec(), &cpu_emb.to_f32_vec());
         let scale = cpu_emb.to_f32_vec().iter().fold(0f32, |m, v| m.max(v.abs()));
         eprintln!("gpu text embeddings {label}: max error {max:.4} (max |ref| {scale:.2}), mean error {mean:.5}, non-finite {nans}");
-        if nans > 0 || max > 0.05 * scale.max(1.0) {
+        if nans > 0 || max > rel * scale.max(1.0) {
             failures.push(format!("text embeddings {label}: max {max:.4}, non-finite {nans}"));
         }
     }
