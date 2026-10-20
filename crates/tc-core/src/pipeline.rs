@@ -220,7 +220,17 @@ pub struct Flux2Engine {
 pub const TEXT_ENCODER_LAYERS: [usize; 3] = [9, 18, 27];
 
 impl Flux2Engine {
-    pub fn new(options: EngineOptions) -> Flux2Engine {
+    pub fn new(mut options: EngineOptions) -> Flux2Engine {
+        if options.quantize && options.device.is_gpu() {
+            // Metal's palettized GEMM needs activations in the palette dtype, and its
+            // depalettize kernel only supports f32/f16 palettes: quantized models run in f16.
+            for dtype in [&mut options.precision.transformer, &mut options.precision.text_encoder] {
+                if *dtype == DataType::BF16 {
+                    info!("--quantize on GPU: running in f16 (bf16 palettes are not supported by Metal)");
+                    *dtype = DataType::F16;
+                }
+            }
+        }
         let graph = Graph::new();
         if options.device.is_gpu() {
             graph.use_gpu_stream();

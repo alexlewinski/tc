@@ -212,7 +212,7 @@ canvas, the rest are references; `--init-image` / `--input-image` are aliases), 
 `--lora FILE[:WEIGHT]` (repeatable), `-o/--output` (`.png`; multiple images get `-N` suffixes),
 `--terminal-image`, `--terminal-image-protocol auto|iterm2|kitty`, `--[no-]download-missing`,
 `--disable-preview`, `--offline`, `--local`, `--remote`, `--remote-url`, `--remote-port`,
-`--[no-]remote-tls`, `--remote-shared-secret`, `--precision`, `--text-encoder-precision`, `--cpu`.
+`--[no-]remote-tls`, `--remote-shared-secret`, `--precision`, `--text-encoder-precision`, `--cpu`, `--quantize`.
 
 Precedence: model recommendations < JSON overrides < explicit flags. Without `--width` /
 `--height`, the size follows the first `--image` (rounded to 64). Video, audio, cloud compute
@@ -229,7 +229,7 @@ diffusers components from Hugging Face; `HF_TOKEN` for gated repos), `models imp
 `--no-tls`, `--no-response-compression`, `--model-browser`, `--no-flash-attention`, `--debug`,
 `--secondary-models-directory`, `--cpu-offload` (unload the text encoder after each prompt),
 `--supervised`, `--max-crashes-within-time-window`, `--crash-time-window`, plus
-`--precision`, `--text-encoder-precision`, `--keep-text-encoder`, `--cpu`. Accepted for
+`--precision`, `--text-encoder-precision`, `--keep-text-encoder`, `--cpu`, `--quantize`. Accepted for
 compatibility but without effect: `-d/--datadog-api-key`, `-w/--weights-cache`,
 `--blob-store-*`, `--fread-preferred`, `--cache-uri`, `--join`,
 `--cancellation-{warning,crash}-timeout`, `--echo-on-queue`.

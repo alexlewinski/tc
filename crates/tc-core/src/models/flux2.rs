@@ -444,7 +444,8 @@ const QUANTIZE_MIN_ELEMENTS: usize = 1 << 16;
 /// values are expanded back to floats (same numerics, no memory saving).
 pub fn upload_weight(graph: &Graph, host: &HostTensor, device: Device, dtype: DataType, quantize: bool) -> Var {
     if quantize && host.shape().len() == 2 && host.numel() >= QUANTIZE_MIN_ELEMENTS {
-        let src_dtype = if dtype == DataType::F32 { DataType::F16 } else { dtype };
+        // Palettes are f16 unless the model runs in f16 already (Metal has no bf16 palette kernel).
+        let src_dtype = if dtype == DataType::F32 || dtype == DataType::BF16 { DataType::F16 } else { dtype };
         let h = host.to_dtype(src_dtype);
         let q = nnc::quant::palettize8_fast(&h, nnc::quant::DEFAULT_BLOCK);
         if device.is_gpu() {

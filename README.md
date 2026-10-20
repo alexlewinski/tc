@@ -76,6 +76,11 @@ runs (it is unloaded after encoding unless `--keep-text-encoder`). LoRAs are mer
 weights when a request needs them and un-merged when it doesn't, so switching LoRAs between
 requests is cheap.
 
+`--quantize` stores the transformer and text-encoder linear weights 8-bit palettized (about
+half the memory, so 9B fits on 16 GB Macs). On GPU it forces f16 for those components, since
+Metal's palettized kernels have no bf16 variant; LoRAs then run as separate low-rank branches.
+bf16 on Metal needs macOS 15 or later.
+
 ## Repository layout
 
 | Path | What |
