@@ -7,11 +7,44 @@ use image::{imageops::FilterType, RgbImage};
 use nnc::HostTensor;
 
 pub fn load_rgb(path: &Path) -> Result<RgbImage> {
-    Ok(image::open(path).with_context(|| format!("reading image {}", path.display()))?.to_rgb8())
+    Ok(flatten_on_white(image::open(path).with_context(|| format!("reading image {}", path.display()))?))
 }
 
 pub fn decode_rgb(bytes: &[u8]) -> Result<RgbImage> {
-    Ok(image::load_from_memory(bytes).context("decoding image")?.to_rgb8())
+    Ok(flatten_on_white(image::load_from_memory(bytes).context("decoding image")?))
+}
+
+/// Drop alpha by compositing over white: transparent areas (e.g. a sketch on a transparent
+/// background) become white instead of whatever colour the transparent pixels happen to store.
+fn flatten_on_white(img: image::DynamicImage) -> RgbImage {
+    if !img.color().has_alpha() {
+        return img.to_rgb8();
+    }
+    let rgba = img.to_rgba8();
+    RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let p = rgba.get_pixel(x, y).0;
+        let a = p[3] as u32;
+        let blend = |c: u8| ((c as u32 * a + 255 * (255 - a) + 127) / 255) as u8;
+        image::Rgb([blend(p[0]), blend(p[1]), blend(p[2])])
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transparent_pixels_become_white() {
+        let img = image::RgbaImage::from_fn(3, 1, |x, _| match x {
+            0 => image::Rgba([0, 0, 0, 0]),       // transparent, black underneath
+            1 => image::Rgba([10, 20, 30, 255]),  // opaque
+            _ => image::Rgba([0, 0, 0, 128]),     // half transparent black
+        });
+        let out = flatten_on_white(image::DynamicImage::ImageRgba8(img));
+        assert_eq!(out.get_pixel(0, 0).0, [255, 255, 255]);
+        assert_eq!(out.get_pixel(1, 0).0, [10, 20, 30]);
+        assert_eq!(out.get_pixel(2, 0).0, [127, 127, 127]);
+    }
 }
 
 /// Resize to exactly `w x h` (Lanczos).
