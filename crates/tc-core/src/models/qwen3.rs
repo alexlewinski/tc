@@ -250,7 +250,7 @@ impl Qwen3 {
         let graph = self.params.get("embed_tokens.weight").graph().clone();
         let len = ids.len();
         let idx = graph.from_host(&HostTensor::from_i32(ids, &[len]), self.device);
-        let mut h = ops::index_select(self.params.get("embed_tokens.weight"), &idx).reshape(&[1, len, self.config.hidden_size]);
+        let mut h = ops::index_select(self.params.get("embed_tokens.weight"), &idx).reshape(&[1, len, self.config.hidden_size]).to_dtype(self.stream_dtype());
         let rope = self.rope(&graph, len);
         let mask = self.mask(&graph, len, valid.max(1));
         let mut outs: Vec<(usize, Var)> = vec![];
@@ -261,7 +261,7 @@ impl Qwen3 {
             h = self.layer(i, &h, &rope, &mask);
             if layers.contains(&(i + 1)) {
                 if i + 1 == self.config.num_hidden_layers {
-                    let n = ops::rms_norm(&h, &[2], self.config.rms_norm_eps, Some(self.params.get("norm.weight")));
+                    let n = self.norm(&h, 2, "norm.weight");
                     outs.push((i + 1, n));
                 } else {
                     outs.push((i + 1, h.clone()));
@@ -273,28 +273,50 @@ impl Qwen3 {
         Ok(ops::concat(&refs, 2))
     }
 
+    /// Type of the residual stream and the norms. With f16 compute (8-bit palettized weights
+    /// on Metal) this is f32: Qwen3's hidden states have outliers of ~2e4, whose squares the
+    /// RMS norms cannot hold in f16. Matrix products and attention stay in the compute type.
+    fn stream_dtype(&self) -> DataType {
+        if self.dtype == DataType::F16 {
+            DataType::F32
+        } else {
+            self.dtype
+        }
+    }
+
+    /// RMS norm over `axis` in the stream type, with the result in the stream type.
+    fn norm(&self, x: &Var, axis: usize, weight: &str) -> Var {
+        let sdt = self.stream_dtype();
+        ops::rms_norm(&x.to_dtype(sdt), &[axis], self.config.rms_norm_eps, Some(&self.params.get(weight).to_dtype(sdt)))
+    }
+
     fn layer(&self, i: usize, x: &Var, rope: &Var, mask: &Var) -> Var {
         let c = &self.config;
         let p = format!("layers.{i}");
-        let eps = c.rms_norm_eps;
         let len = x.dim(1);
         let hd = c.head_dim();
+        let (dt, sdt) = (self.dtype, self.stream_dtype());
         let get = |n: &str| self.params.get(&format!("{p}.{n}"));
         let bias = |n: &str| self.params.try_get(&format!("{p}.{n}"));
-        let h = ops::rms_norm(x, &[2], eps, Some(get("input_layernorm.weight")));
+        let norm = |x: &Var, axis: usize, n: &str| self.norm(x, axis, &format!("{p}.{n}"));
+        let h = norm(x, 2, "input_layernorm.weight").to_dtype(dt);
         let q = ops::linear(&h, get("self_attn.q_proj.weight"), bias("self_attn.q_proj.bias")).reshape(&[1, len, c.num_attention_heads, hd]);
         let k = ops::linear(&h, get("self_attn.k_proj.weight"), bias("self_attn.k_proj.bias")).reshape(&[1, len, c.num_key_value_heads, hd]);
         let v = ops::linear(&h, get("self_attn.v_proj.weight"), bias("self_attn.v_proj.bias")).reshape(&[1, len, c.num_key_value_heads, hd]);
-        let q = ops::cmul(&ops::rms_norm(&q, &[3], eps, Some(get("self_attn.q_norm.weight"))), rope);
-        let k = ops::cmul(&ops::rms_norm(&k, &[3], eps, Some(get("self_attn.k_norm.weight"))), rope);
+        let q = ops::cmul(&norm(&q, 3, "self_attn.q_norm.weight").to_dtype(dt), rope);
+        let k = ops::cmul(&norm(&k, 3, "self_attn.k_norm.weight").to_dtype(dt), rope);
         let a = ops::scaled_dot_product_attention(&q, &k, &v, 1.0 / (hd as f32).sqrt(), false, Some(mask));
         let a = a.reshape(&[1, len, c.num_attention_heads * hd]);
-        let x = ops::add(x, &ops::linear(&a, get("self_attn.o_proj.weight"), None));
-        let h = ops::rms_norm(&x, &[2], eps, Some(get("post_attention_layernorm.weight")));
+        let x = ops::add(x, &ops::linear(&a, get("self_attn.o_proj.weight"), None).to_dtype(sdt));
+        let h = norm(&x, 2, "post_attention_layernorm.weight").to_dtype(dt);
         let gate = ops::linear(&h, get("mlp.gate_proj.weight"), None);
         let up = ops::linear(&h, get("mlp.up_proj.weight"), None);
-        let m = ops::linear(&ops::mul(&ops::silu(&gate), &up), get("mlp.down_proj.weight"), None);
-        ops::add(&x, &m)
+        let mut prod = ops::mul(&ops::silu(&gate.to_dtype(sdt)), &up.to_dtype(sdt));
+        if dt == DataType::F16 {
+            prod = ops::clamp(&prod, Some(-65504.0), Some(65504.0));
+        }
+        let m = ops::linear(&prod.to_dtype(dt), get("mlp.down_proj.weight"), None);
+        ops::add(&x, &m.to_dtype(sdt))
     }
 }
 
