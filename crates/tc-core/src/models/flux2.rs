@@ -982,12 +982,22 @@ impl Flux2 {
     }
 
     fn forward_impl(&self, img: &Var, txt: &Var, step: &Flux2Step, rope: &Var, kv: Option<(&Flux2Step, usize)>) -> Var {
+        // TC_DEBUG_STATS=1: activation statistics after every block of the first forward pass.
+        let stats = crate::debug::stats_enabled() && FORWARD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
         let mut img = self.lin(img, "img_in.weight");
         let mut txt = self.lin(txt, "txt_in.weight");
+        if stats {
+            crate::debug::print_stats("img_in", &img);
+            crate::debug::print_stats("txt_in", &txt);
+        }
         for i in 0..self.config.num_layers {
             let (a, b) = self.double_block(i, img, txt, step, rope, kv);
             img = a;
             txt = b;
+            if stats {
+                crate::debug::print_stats(&format!("double {i} img"), &img);
+                crate::debug::print_stats(&format!("double {i} txt"), &txt);
+            }
         }
         let lt = txt.dim(1);
         let n_ref = kv.map(|k| k.1).unwrap_or(0);
@@ -997,6 +1007,9 @@ impl Flux2 {
         drop(img);
         for i in 0..self.config.num_single_layers {
             x = self.single_block(i, x, step, rope, lt, kv);
+            if stats {
+                crate::debug::print_stats(&format!("single {i}"), &x);
+            }
         }
         let x = x.narrow(1, lt + n_ref, li).contiguous();
         let emb = self.lin(&ops::silu(&step.temb), "final_layer.adaLN_modulation.1.weight");
@@ -1006,9 +1019,15 @@ impl Flux2 {
         let shift = emb.narrow(2, 0, dim).contiguous();
         let scale = ops::add_scalar(&emb.narrow(2, dim, dim).contiguous(), 1.0);
         let x = self.modulate(&x, &shift, &scale);
-        self.lin(&x, "final_layer.linear.weight")
+        let out = self.lin(&x, "final_layer.linear.weight");
+        if stats {
+            crate::debug::print_stats("final", &out);
+        }
+        out
     }
 }
+
+static FORWARD_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The tensors of a Draw Things FLUX.2 checkpoint (names and splits as in Draw Things' own
 /// files, f32), from any source; the inverse of [`dt_mapping`]. Used to build test models.

@@ -530,6 +530,14 @@ impl Flux2Engine {
             bail!("strength {} leaves no denoising steps", p.strength);
         }
 
+        let stats = crate::debug::stats_enabled();
+        if stats {
+            eprintln!("[stats] {} target tokens ({lh}x{lw}), {} text tokens, kv {kv}, sigmas {sig:?}", lh * lw, txt_len);
+            crate::debug::print_stats("text cond", &cond_v);
+            if let Some(r) = &refs_cat {
+                crate::debug::print_stats("reference latents", r);
+            }
+        }
         let n_ref = refs_cat.as_ref().map(|r| r.dim(1)).unwrap_or(0);
         let ref_step = if kv { Some(model.prepare_step(&[0.0], None)) } else { None };
         let mut images = vec![];
@@ -578,6 +586,10 @@ impl Flux2Engine {
                     v = ops::add_scaled(&vu, &d, 1.0, p.guidance_scale);
                 }
                 let v = v.to_dtype(DataType::F32);
+                if stats {
+                    crate::debug::print_stats(&format!("step {} x", i + 1), &x);
+                    crate::debug::print_stats(&format!("step {} v", i + 1), &v);
+                }
                 if p.sampler == Sampler::EulerAncestral && s_next > 0.0 {
                     let x0 = ops::add_scaled(&x, &v, 1.0, -(s as f32));
                     let fresh = draw_noise(&mut rng);
@@ -592,6 +604,9 @@ impl Flux2Engine {
             check(cancel)?;
             let vae_dtype = self.options.precision.vae;
             let vae = self.vae.as_ref().unwrap();
+            if stats {
+                crate::debug::print_stats("final latent", &x);
+            }
             let packed = x.reshape(&[1, lh, lw, channels]).to_dtype(vae_dtype);
             let raw = vae.unpack_latents(&packed);
             let img = vae.decode_raw(&raw).to_dtype(DataType::F32).to_host();

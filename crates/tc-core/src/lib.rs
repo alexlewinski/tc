@@ -11,6 +11,7 @@ pub mod rng;
 pub mod scheduler;
 pub mod tokenizer;
 pub mod ckpt;
+pub mod debug;
 pub mod compare;
 pub mod gpucheck;
 pub mod image_io;
