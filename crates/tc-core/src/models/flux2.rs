@@ -762,8 +762,27 @@ impl Flux2 {
         Ok(())
     }
 
+    /// Matrix product in the compute type (inputs are converted to it).
     fn lin(&self, x: &Var, name: &str) -> Var {
-        linear_with_adapters(x, self.params.get(name), self.adapters.get(name))
+        let x = x.to_dtype(self.dtype);
+        linear_with_adapters(&x, self.params.get(name), self.adapters.get(name))
+    }
+
+    /// Type of the residual streams, norms, modulation and gating. With f16 compute (8-bit
+    /// palettized weights on Metal) this is f32: FLUX.2's text stream outgrows f16's range
+    /// (Qwen3 features reach ~2e4 and grow through the double blocks), which saturated the
+    /// whole stream from the first single block on. Matrix products and attention stay f16.
+    fn stream_dtype(&self) -> DataType {
+        if self.dtype == DataType::F16 {
+            DataType::F32
+        } else {
+            self.dtype
+        }
+    }
+
+    /// Matrix product with the result in the stream type.
+    fn lin_s(&self, x: &Var, name: &str) -> Var {
+        self.lin(x, name).to_dtype(self.stream_dtype())
     }
 
     fn graph(&self) -> &Graph {
@@ -777,7 +796,7 @@ impl Flux2 {
         let m = m.reshape(&[b, 1, 3 * sets * dim]);
         (0..3 * sets)
             .map(|i| {
-                let c = m.narrow(2, i * dim, dim).contiguous();
+                let c = m.narrow(2, i * dim, dim).contiguous().to_dtype(self.stream_dtype());
                 // Scale chunks are used as (1 + scale).
                 if i % 3 == 1 {
                     ops::add_scalar(&c, 1.0)
@@ -816,16 +835,8 @@ impl Flux2 {
     }
 
     fn modulate(&self, x: &Var, shift: &Var, scale1p: &Var) -> Var {
-        let n = ops::layer_norm(x, &[2], self.config.eps, None);
+        let n = ops::layer_norm(&x.to_dtype(self.stream_dtype()), &[2], self.config.eps, None);
         ops::add(&ops::mul(&n, scale1p), shift)
-    }
-
-    fn clamp_f16(&self, x: Var) -> Var {
-        if self.dtype == DataType::F16 {
-            ops::clamp(&x, Some(-65504.0), Some(65504.0))
-        } else {
-            x
-        }
     }
 
     /// Split fused `[B, T, 3*inner]` into normalized q, k and v, shaped `[B, T, H, D]`.
@@ -836,9 +847,10 @@ impl Flux2 {
         let inner = h * d;
         // nnc CPU kernels handle at most 4-D tensors, so split along the flat channel axis.
         let take = |i: usize| qkv.narrow(2, i * inner, inner).contiguous().reshape(&[b, t, h, d]);
-        let q = ops::rms_norm(&take(0), &[3], 1e-6, Some(self.params.get(q_norm)));
-        let k = ops::rms_norm(&take(1), &[3], 1e-6, Some(self.params.get(k_norm)));
-        (q, k, take(2))
+        // RMS norm squares its input: compute it in the stream type, attend in the compute type.
+        let sdt = self.stream_dtype();
+        let norm = |x: Var, w: &str| ops::rms_norm(&x.to_dtype(sdt), &[3], 1e-6, Some(&self.params.get(w).to_dtype(sdt))).to_dtype(self.dtype);
+        (norm(take(0), q_norm), norm(take(1), k_norm), take(2).to_dtype(self.dtype))
     }
 
     fn attention(&self, q: &Var, k: &Var, v: &Var, rope: &Var) -> Var {
@@ -892,8 +904,18 @@ impl Flux2 {
         let m = h.dim(2) / 2;
         let a = h.narrow(2, 0, m).contiguous();
         let gate = h.narrow(2, m, m).contiguous();
-        let h = ops::mul(&ops::silu(&a), &gate);
-        self.lin(&h, w_out)
+        self.lin_s(&self.silu_gate(&a, &gate), w_out)
+    }
+
+    /// `silu(a) * gate`, computed in the stream type and limited to the compute type's range.
+    fn silu_gate(&self, a: &Var, gate: &Var) -> Var {
+        let sdt = self.stream_dtype();
+        let h = ops::mul(&ops::silu(&a.to_dtype(sdt)), &gate.to_dtype(sdt));
+        if self.dtype == DataType::F16 {
+            ops::clamp(&h, Some(-65504.0), Some(65504.0))
+        } else {
+            h
+        }
     }
 
     fn double_block(&self, i: usize, img: Var, txt: Var, step: &Flux2Step, rope: &Var, kv: Option<(&Flux2Step, usize)>) -> (Var, Var) {
@@ -926,8 +948,8 @@ impl Flux2 {
         let attn = self.attention_kv(&q, &k, &v, rope, lt, n_ref);
         let txt_attn = attn.narrow(1, 0, lt).contiguous();
         let img_attn = attn.narrow(1, lt, li).contiguous();
-        let img_attn = self.lin(&img_attn, &format!("{p}.img_attn.proj.weight"));
-        let txt_attn = self.lin(&txt_attn, &format!("{p}.txt_attn.proj.weight"));
+        let img_attn = self.lin_s(&img_attn, &format!("{p}.img_attn.proj.weight"));
+        let txt_attn = self.lin_s(&txt_attn, &format!("{p}.txt_attn.proj.weight"));
         let img = ops::add(&img, &Self::segmented(&img_attn, &segs, |x, m| ops::mul(x, &m[2])));
         let img_n = Self::segmented(&img, &segs, |x, m| self.modulate(x, &m[3], &m[4]));
         let img_ff = self.swiglu_mlp(&img_n, &format!("{p}.img_mlp.0.weight"), &format!("{p}.img_mlp.2.weight"));
@@ -936,7 +958,7 @@ impl Flux2 {
         let txt_n = self.modulate(&txt, &tm[3], &tm[4]);
         let txt_ff = self.swiglu_mlp(&txt_n, &format!("{p}.txt_mlp.0.weight"), &format!("{p}.txt_mlp.2.weight"));
         let txt = ops::add(&txt, &ops::mul(&txt_ff, &tm[5]));
-        (self.clamp_f16(img), self.clamp_f16(txt))
+        (img, txt)
     }
 
     fn single_block(&self, i: usize, x: Var, step: &Flux2Step, rope: &Var, lt: usize, kv: Option<(&Flux2Step, usize)>) -> Var {
@@ -956,9 +978,9 @@ impl Flux2 {
         let attn = self.attention_kv(&q, &k, &v, rope, lt, n_ref);
         let a = h.narrow(2, 3 * inner, mlp).contiguous();
         let gate = h.narrow(2, 3 * inner + mlp, mlp).contiguous();
-        let m = ops::mul(&ops::silu(&a), &gate);
-        let out = ops::add(&self.lin(&attn, &format!("{p}.linear2_attn.weight")), &self.lin(&m, &format!("{p}.linear2_mlp.weight")));
-        self.clamp_f16(ops::add(&x, &Self::segmented(&out, &segs, |x, m| ops::mul(x, &m[2]))))
+        let m = self.silu_gate(&a, &gate);
+        let out = ops::add(&self.lin_s(&attn, &format!("{p}.linear2_attn.weight")), &self.lin_s(&m, &format!("{p}.linear2_mlp.weight")));
+        ops::add(&x, &Self::segmented(&out, &segs, |x, m| ops::mul(x, &m[2])))
     }
 
     /// Run the transformer.
@@ -984,8 +1006,8 @@ impl Flux2 {
     fn forward_impl(&self, img: &Var, txt: &Var, step: &Flux2Step, rope: &Var, kv: Option<(&Flux2Step, usize)>) -> Var {
         // TC_DEBUG_STATS=1: activation statistics after every block of the first forward pass.
         let stats = crate::debug::stats_enabled() && FORWARD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
-        let mut img = self.lin(img, "img_in.weight");
-        let mut txt = self.lin(txt, "txt_in.weight");
+        let mut img = self.lin_s(img, "img_in.weight");
+        let mut txt = self.lin_s(txt, "txt_in.weight");
         if stats {
             crate::debug::print_stats("img_in", &img);
             crate::debug::print_stats("txt_in", &txt);
@@ -1016,8 +1038,9 @@ impl Flux2 {
         let dim = self.config.inner_dim();
         let b = emb.dim(0);
         let emb = emb.reshape(&[b, 1, 2 * dim]);
-        let shift = emb.narrow(2, 0, dim).contiguous();
-        let scale = ops::add_scalar(&emb.narrow(2, dim, dim).contiguous(), 1.0);
+        let sdt = self.stream_dtype();
+        let shift = emb.narrow(2, 0, dim).contiguous().to_dtype(sdt);
+        let scale = ops::add_scalar(&emb.narrow(2, dim, dim).contiguous().to_dtype(sdt), 1.0);
         let x = self.modulate(&x, &shift, &scale);
         let out = self.lin(&x, "final_layer.linear.weight");
         if stats {

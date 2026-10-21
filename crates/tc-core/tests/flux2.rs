@@ -120,3 +120,46 @@ fn flux2_kv_variant_matches_diffusers() {
         assert_close(&y.to_f32_vec(), &io.read_f32(key).unwrap(), 1e-4, key);
     }
 }
+
+/// f16 compute (as with 8-bit palettized weights on Metal) with text features as large as
+/// Qwen3's real outliers (~2e4): the streams must not saturate. Before the residual streams,
+/// norms and gating moved to f32, f16 squared these values in the layer norm and the whole
+/// stream ended at the f16 limit (the 9B model then produced pure noise). GPU only: nnc's CPU
+/// matrix products are f32.
+#[test]
+fn flux2_f16_with_large_text_features_gpu() {
+    if !device().is_gpu() {
+        return;
+    }
+    let dir = "flux2";
+    let (source, config) = open_source(&fixture(dir).join("transformer")).unwrap();
+    let io = SafeTensorsFiles::open(&[fixture(dir).join("flux2_io.safetensors")]).unwrap();
+    let x = io.read_f32("x").unwrap();
+    let x_shape = io.info("x").unwrap().shape.clone();
+    let ctx = io.read_f32("ctx").unwrap();
+    let ctx_shape = io.info("ctx").unwrap().shape.clone();
+    // Scale the text features so their largest value is 2e4.
+    let peak = ctx.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let ctx: Vec<f32> = ctx.iter().map(|v| v * 2e4 / peak).collect();
+    let mut ids = text_ids(5);
+    ids.extend(image_ids(4, 4, 0.0));
+    ids.extend(image_ids(2, 2, 10.0));
+    let (rope, rope_shape) = rope_table(&ids, &config.axes_dims_rope, config.rope_theta);
+    let run = |dev: Device, dtype: DataType| -> Vec<f32> {
+        let g = Graph::new();
+        let model = Flux2::load(&g, &source, config.clone(), dev, dtype, false).unwrap();
+        let xv = g.from_f32(&x, &x_shape, dev, dtype);
+        let cv = g.from_f32(&ctx, &ctx_shape, dev, dtype);
+        let rv = g.from_f32(&rope, &rope_shape, dev, dtype);
+        let step = model.prepare_step(&[700.0], None);
+        model.forward(&xv, &cv, &step, &rv).to_f32_vec()
+    };
+    let reference = run(Device::Cpu, DataType::F32);
+    let got = run(device(), DataType::F16);
+    assert!(got.iter().all(|v| v.is_finite()), "non-finite output");
+    let num: f64 = got.iter().zip(&reference).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+    let den: f64 = reference.iter().map(|b| (*b as f64).powi(2)).sum();
+    let rel = (num / den).sqrt();
+    eprintln!("f16 GPU vs f32 CPU with large text features: rel {rel:.5}");
+    assert!(rel < 0.02, "rel {rel}");
+}
