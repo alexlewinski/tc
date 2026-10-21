@@ -91,6 +91,10 @@ DT="$HOME/Library/Containers/com.liuliu.draw-things/Data/Documents/Models"
   `https://models.drawthings.ai/models_sha256.json`.
 * Supported encodings: raw, zip, fpzip, ezm7 and q8p (all FLUX.2 [klein] `_q8p` / `_f16` files and
   the LoRA files Draw Things writes); `_q6p` / `_i8x` files are reported as unsupported.
+* `models check-gpu flux_2_klein_9b_kv_q8p.ckpt --lora ...` runs the model as `generate` loads
+  it on the GPU and, expanded to f32, on the CPU, and prints the relative error of each stage
+  (palettized matrix products, first transformer blocks in plain and KV mode with the LoRAs,
+  first Qwen3 layers, VAE), to locate GPU problems with your own files.
 * `models compare CKPT REFERENCE` checks a checkpoint against the official release tensor by
   tensor, and a Draw Things LoRA against its original `.safetensors` (relative difference of the
   weight updates and best-fit scale).

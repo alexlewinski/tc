@@ -120,6 +120,34 @@ enum ModelsCommand {
         #[arg(long)]
         lora: Vec<String>,
     },
+    /// Check the GPU against the CPU for a model loaded as `generate` loads it (8-bit palettized
+    /// weights, f16/bf16): single matrix products, the first transformer blocks in plain and KV mode
+    /// with LoRAs, the first Qwen3 layers and a VAE round trip. Prints the relative error per stage.
+    CheckGpu {
+        #[command(flatten)]
+        dir: ModelsDir,
+        /// Model (e.g. flux_2_klein_9b_kv_q8p.ckpt).
+        model: String,
+        /// LoRA FILE[:WEIGHT] (repeatable).
+        #[arg(long)]
+        lora: Vec<String>,
+        /// Transformer blocks to check: double and single (default 1 1; each double block costs
+        /// about 2 GB of CPU memory in f32).
+        #[arg(long, num_args = 2, default_values_t = [1, 1])]
+        blocks: Vec<usize>,
+        /// Transformer / text encoder precision on the GPU (default bf16; palettized weights run in f16).
+        #[arg(long)]
+        precision: Option<String>,
+        /// Skip the text encoder check.
+        #[arg(long)]
+        no_text_encoder: bool,
+        /// Skip the VAE check.
+        #[arg(long)]
+        no_vae: bool,
+        /// Run the "device" side on the CPU too (tests the check itself).
+        #[arg(long, hide = true)]
+        cpu: bool,
+    },
     /// Compare a Draw Things checkpoint tensor by tensor with the official release of the same
     /// component (diffusers snapshot directory, component directory or safetensors file). For a
     /// Draw Things LoRA, compare its weight updates with the original LoRA file.
@@ -329,6 +357,39 @@ fn models(cmd: ModelsCommand) -> Result<()> {
             let store = store_for(&dir)?;
             let path = store.local_file(&file).with_context(|| format!("{file} not found"))?;
             print!("{}", zoo::inspect_ckpt(&store, &path, &lora)?);
+            Ok(())
+        }
+        ModelsCommand::CheckGpu { dir, model, lora, blocks, precision, no_text_encoder, no_vae, cpu } => {
+            let store = store_for(&dir)?;
+            let resolved = store.resolve(&model)?;
+            let device = if cpu { nnc::Device::Cpu } else { nnc::default_device() };
+            if !device.is_gpu() && !cpu {
+                bail!("no GPU found (nnc sees {} GPUs)", nnc::gpu_count());
+            }
+            let mut p = Precision::default_for(if cpu { nnc::Device::Cpu } else { nnc::Device::Gpu(0) });
+            if let Some(pr) = precision {
+                p.transformer = parse_dtype(&pr)?;
+                p.text_encoder = p.transformer;
+            }
+            let mut loras = vec![];
+            for l in &lora {
+                let (f, w) = match l.rsplit_once(':') {
+                    Some((f, w)) if w.parse::<f32>().is_ok() => (f.to_string(), w.parse().unwrap()),
+                    _ => (l.clone(), 1.0),
+                };
+                let path = store.resolve_lora(&f).with_context(|| format!("LoRA {f:?} not found"))?;
+                loras.push(tc_core::pipeline::LoraSpec { path, weight: w });
+            }
+            let o = tc_core::gpucheck::CheckOptions {
+                device,
+                precision: p,
+                double_blocks: blocks[0],
+                single_blocks: blocks[1],
+                text_encoder: !no_text_encoder,
+                vae: !no_vae,
+            };
+            tc_core::gpucheck::run(&resolved.files, &loras, &o, &mut |l| println!("{l}"))?;
+            println!("(ok: within the expected rounding of f16/bf16 against f32; FAIL: the device computes something else)");
             Ok(())
         }
         ModelsCommand::Compare { dir, ckpt, reference, filter, all } => {

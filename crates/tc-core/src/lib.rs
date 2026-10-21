@@ -12,5 +12,6 @@ pub mod scheduler;
 pub mod tokenizer;
 pub mod ckpt;
 pub mod compare;
+pub mod gpucheck;
 pub mod image_io;
 pub mod pipeline;

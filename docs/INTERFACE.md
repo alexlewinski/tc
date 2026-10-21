@@ -227,7 +227,11 @@ model's other components), `models inspect FILE [--lora L ...]` (describes a Dra
 checkpoint: component, encodings, resolved companion files, LoRA coverage), `models compare CKPT
 REFERENCE [--filter S] [--all]` (tensor-by-tensor comparison of a Draw Things checkpoint with the
 official release; for a Draw Things LoRA, comparison of its weight updates with the original
-LoRA file), `completion bash|zsh|fish|elvish|powershell`.
+LoRA file), `models check-gpu MODEL [--lora FILE[:W] ...] [--blocks D S] [--precision P]
+[--no-text-encoder] [--no-vae]` (runs a model as `generate` loads it on the GPU and expanded to f32
+on the CPU, on the same inputs, and prints the relative error of each stage: palettized matrix
+products, the first transformer blocks in plain and KV mode with LoRAs, the first Qwen3 layers, a
+VAE decode / encode), `completion bash|zsh|fish|elvish|powershell`.
 
 ### Draw Things checkpoint files
 

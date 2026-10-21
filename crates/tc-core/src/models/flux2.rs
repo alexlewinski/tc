@@ -737,6 +737,13 @@ pub struct Flux2Step {
     single_mod: Vec<Var>,
 }
 
+impl Flux2Step {
+    /// The first image-stream modulation chunk (shift of the first norm), for diagnostics.
+    pub fn img_mod_first(&self) -> &Var {
+        &self.img_mod[0]
+    }
+}
+
 impl Flux2 {
     /// Upload all weights from `source`.
     pub fn load(graph: &Graph, source: &Flux2Source, config: Flux2Config, device: Device, dtype: DataType, quantize: bool) -> Result<Flux2> {
